@@ -12,7 +12,7 @@ import (
 	"github.com/darsheee/remgo/internal/db"
 )
 
-func setupTestServer(t *testing.T) (*Server, *db.DB) {
+func setupTestServer(t *testing.T, authEnabled ...bool) (*Server, *db.DB) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "api_test.db")
 	database, err := db.Open(dbPath)
@@ -22,7 +22,7 @@ func setupTestServer(t *testing.T) (*Server, *db.DB) {
 	t.Cleanup(func() {
 		database.Close()
 	})
-	srv := NewServer(database, nil)
+	srv := NewServer(database, nil, authEnabled...)
 	return srv, database
 }
 
@@ -229,3 +229,151 @@ func TestAPIGetRemBacklinks(t *testing.T) {
 	}
 }
 
+func TestAuthWorkflowAndEnforcement(t *testing.T) {
+	srv, _ := setupTestServer(t, true) // auth enabled
+	handler := srv.Handler()
+
+	// 1. Without auth, protected route /api/tree returns 401
+	unauthReq := httptest.NewRequest("GET", "/api/tree", nil)
+	wUnauth := httptest.NewRecorder()
+	handler.ServeHTTP(wUnauth, unauthReq)
+	if wUnauth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated request, got %d", wUnauth.Code)
+	}
+
+	// 2. Status check shows auth_enabled = true, has_users = false
+	statusReq := httptest.NewRequest("GET", "/api/auth/status", nil)
+	wStatus := httptest.NewRecorder()
+	handler.ServeHTTP(wStatus, statusReq)
+	var statusRes struct {
+		AuthEnabled bool `json:"auth_enabled"`
+		HasUsers    bool `json:"has_users"`
+	}
+	json.Unmarshal(wStatus.Body.Bytes(), &statusRes)
+	if !statusRes.AuthEnabled || statusRes.HasUsers {
+		t.Fatalf("unexpected status: %+v", statusRes)
+	}
+
+	// 3. Register First Admin User via /api/auth/setup
+	setupBody := `{"username":"admin", "email":"admin@remgo.dev", "password":"adminpassword123"}`
+	setupReq := httptest.NewRequest("POST", "/api/auth/setup", strings.NewReader(setupBody))
+	setupReq.Header.Set("Content-Type", "application/json")
+	wSetup := httptest.NewRecorder()
+	handler.ServeHTTP(wSetup, setupReq)
+
+	if wSetup.Code != http.StatusCreated {
+		t.Fatalf("setup failed with %d: %s", wSetup.Code, wSetup.Body.String())
+	}
+
+	var setupResp struct {
+		User  *db.User `json:"user"`
+		Token string   `json:"token"`
+	}
+	json.Unmarshal(wSetup.Body.Bytes(), &setupResp)
+	adminToken := setupResp.Token
+	if adminToken == "" || setupResp.User.Role != "admin" {
+		t.Fatalf("invalid setup response: %+v", setupResp)
+	}
+
+	// Verify session cookie was set
+	cookies := wSetup.Result().Cookies()
+	var sessionCookie *http.Cookie
+	for _, c := range cookies {
+		if c.Name == "remgo_token" {
+			sessionCookie = c
+			break
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatalf("expected remgo_token cookie to be set")
+	}
+
+	// 4. Access protected route with Bearer token
+	treeReq := httptest.NewRequest("GET", "/api/tree", nil)
+	treeReq.Header.Set("Authorization", "Bearer "+adminToken)
+	wTree := httptest.NewRecorder()
+	handler.ServeHTTP(wTree, treeReq)
+	if wTree.Code != http.StatusOK {
+		t.Fatalf("access with Bearer token returned %d", wTree.Code)
+	}
+
+	// 5. Access protected route with session Cookie
+	treeCookieReq := httptest.NewRequest("GET", "/api/tree", nil)
+	treeCookieReq.AddCookie(sessionCookie)
+	wTreeCookie := httptest.NewRecorder()
+	handler.ServeHTTP(wTreeCookie, treeCookieReq)
+	if wTreeCookie.Code != http.StatusOK {
+		t.Fatalf("access with cookie returned %d", wTreeCookie.Code)
+	}
+
+	// 6. Create Personal Access Token (PAT)
+	patReq := httptest.NewRequest("POST", "/api/auth/keys", strings.NewReader(`{"name":"Cursor MCP"}`))
+	patReq.Header.Set("Authorization", "Bearer "+adminToken)
+	patReq.Header.Set("Content-Type", "application/json")
+	wPAT := httptest.NewRecorder()
+	handler.ServeHTTP(wPAT, patReq)
+
+	if wPAT.Code != http.StatusCreated {
+		t.Fatalf("create PAT returned %d: %s", wPAT.Code, wPAT.Body.String())
+	}
+	var patResp struct {
+		Key string `json:"key"`
+	}
+	json.Unmarshal(wPAT.Body.Bytes(), &patResp)
+	if !strings.HasPrefix(patResp.Key, "remgo_pat_") {
+		t.Fatalf("invalid PAT: %s", patResp.Key)
+	}
+
+	// 7. MCP call with PAT via X-API-Key header
+	mcpReq := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rem","arguments":{"content":"MCP Note via PAT"}}}`
+	mReq := httptest.NewRequest("POST", "/mcp", strings.NewReader(mcpReq))
+	mReq.Header.Set("X-API-Key", patResp.Key)
+	mReq.Header.Set("Content-Type", "application/json")
+	wMCP := httptest.NewRecorder()
+	handler.ServeHTTP(wMCP, mReq)
+	if wMCP.Code != http.StatusOK {
+		t.Fatalf("MCP with PAT returned %d: %s", wMCP.Code, wMCP.Body.String())
+	}
+
+	// 8. MCP call without auth -> must be rejected with 401
+	unauthMCP := httptest.NewRequest("POST", "/mcp", strings.NewReader(mcpReq))
+	wUnauthMCP := httptest.NewRecorder()
+	handler.ServeHTTP(wUnauthMCP, unauthMCP)
+	if wUnauthMCP.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated MCP call, got %d", wUnauthMCP.Code)
+	}
+
+	// 9. Multi-User Isolation: Register second user Bob
+	regBody := `{"username":"bob", "email":"bob@remgo.dev", "password":"bobpassword123"}`
+	regReq := httptest.NewRequest("POST", "/api/auth/register", strings.NewReader(regBody))
+	regReq.Header.Set("Content-Type", "application/json")
+	wReg := httptest.NewRecorder()
+	handler.ServeHTTP(wReg, regReq)
+	if wReg.Code != http.StatusCreated {
+		t.Fatalf("bob registration failed: %s", wReg.Body.String())
+	}
+	var regResp struct {
+		Token string `json:"token"`
+	}
+	json.Unmarshal(wReg.Body.Bytes(), &regResp)
+	bobToken := regResp.Token
+
+	// Bob creates note
+	bobCreateReq := httptest.NewRequest("POST", "/api/rems", strings.NewReader(`{"content":"Bob Private Secret"}`))
+	bobCreateReq.Header.Set("Authorization", "Bearer "+bobToken)
+	bobCreateReq.Header.Set("Content-Type", "application/json")
+	wBobCreate := httptest.NewRecorder()
+	handler.ServeHTTP(wBobCreate, bobCreateReq)
+	if wBobCreate.Code != http.StatusCreated {
+		t.Fatalf("bob create rem failed: %s", wBobCreate.Body.String())
+	}
+
+	// Admin queries tree -> should NOT see Bob's note
+	adminTreeReq := httptest.NewRequest("GET", "/api/tree", nil)
+	adminTreeReq.Header.Set("Authorization", "Bearer "+adminToken)
+	wAdminTree := httptest.NewRecorder()
+	handler.ServeHTTP(wAdminTree, adminTreeReq)
+	if strings.Contains(wAdminTree.Body.String(), "Bob Private Secret") {
+		t.Fatalf("Admin saw Bob's private note! Data leakage!")
+	}
+}

@@ -67,6 +67,25 @@
         <!-- Rendered dynamically -->
       </div>
 
+      <!-- User Profile & Auth Section -->
+      <div class="user-profile-section" id="userProfileSection">
+        <div class="user-profile-info" onclick="app.openAuthOrProfile()">
+          <div class="user-avatar" id="userAvatar">U</div>
+          <div class="user-details">
+            <span class="user-name" id="userName">User</span>
+            <span class="user-role" id="userRole">Local</span>
+          </div>
+        </div>
+        <div class="user-actions">
+          <button class="btn-icon-tiny" title="Personal Access Tokens (MCP)" onclick="app.openAPIKeysModal()">
+            🔑
+          </button>
+          <button class="btn-icon-tiny" id="authActionBtn" title="Account" onclick="app.handleAuthActionClick()">
+            🚪
+          </button>
+        </div>
+      </div>
+
       <div class="sidebar-footer">
         <button class="btn btn-sm" onclick="app.openImportExportModal()">
           <span>⇄ Export / Import</span>
@@ -221,10 +240,10 @@
             Export your entire RemGo database to Markdown outline or standard JSON:
           </p>
           <div style="display: flex; gap: 10px; margin-bottom: 20px;">
-            <a href="/api/export" download="remgo_export.md" class="btn btn-sm">
+            <a href="/api/export" id="exportMdLink" download="remgo_export.md" class="btn btn-sm">
               <span>📥 Export Markdown (.md)</span>
             </a>
-            <a href="/api/export?format=json" download="remgo_export.json" class="btn btn-sm">
+            <a href="/api/export?format=json" id="exportJsonLink" download="remgo_export.json" class="btn btn-sm">
               <span>📥 Export JSON (.json)</span>
             </a>
           </div>
@@ -240,6 +259,104 @@
         </div>
       </div>
     </div>
+
+    <!-- Authentication Modal (Login / Sign Up / Setup) -->
+    <div class="modal-backdrop hidden" id="authModal" onclick="app.handleModalBackdropClick(event, 'authModal')">
+      <div class="modal-box auth-modal-box">
+        <div class="auth-modal-header">
+          <div class="auth-brand">
+            <svg viewBox="0 0 32 32" fill="none" width="32" height="32">
+              <rect width="32" height="32" rx="8" fill="#6366f1"/>
+              <circle cx="10" cy="11" r="2.5" fill="#ffffff"/>
+              <rect x="15" y="9.5" width="10" height="3" rx="1.5" fill="#ffffff"/>
+              <circle cx="10" cy="19" r="2.5" fill="#a5b4fc"/>
+              <rect x="15" y="17.5" width="8" height="3" rx="1.5" fill="#a5b4fc"/>
+            </svg>
+            <h2 id="authModalTitle">Welcome to RemGo</h2>
+          </div>
+          <p class="auth-subtitle" id="authModalSubtitle">Sign in to sync your notes and review schedules</p>
+        </div>
+
+        <div class="auth-tabs" id="authTabs">
+          <button class="auth-tab active" id="authTabLogin" onclick="app.switchAuthTab('login')">Log In</button>
+          <button class="auth-tab" id="authTabRegister" onclick="app.switchAuthTab('register')">Sign Up</button>
+        </div>
+
+        <div id="authAlert" class="auth-alert hidden"></div>
+
+        <form id="authForm" onsubmit="app.submitAuth(event)">
+          <div class="form-group">
+            <label for="authUsername" class="form-label" id="authUsernameLabel">Username</label>
+            <input type="text" id="authUsername" class="form-input" placeholder="Enter username or email" required autocomplete="username">
+          </div>
+
+          <div class="form-group" id="authEmailGroup" style="display: none;">
+            <label for="authEmail" class="form-label">Email</label>
+            <input type="email" id="authEmail" class="form-input" placeholder="user@example.com" autocomplete="email">
+          </div>
+
+          <div class="form-group">
+            <label for="authPassword" class="form-label">Password</label>
+            <input type="password" id="authPassword" class="form-input" placeholder="••••••••" required autocomplete="current-password">
+          </div>
+
+          <button type="submit" class="btn btn-primary btn-block" id="authSubmitBtn">
+            <span>Log In</span>
+          </button>
+        </form>
+
+        <div class="auth-footer" id="authFooter">
+          <span id="authSwitchPrompt">Don't have an account?</span>
+          <a href="#" id="authSwitchLink" onclick="app.toggleAuthMode(); return false;">Create one</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- Personal Access Tokens (API Keys) Modal -->
+    <div class="modal-backdrop hidden" id="apiKeysModal" onclick="app.handleModalBackdropClick(event, 'apiKeysModal')">
+      <div class="modal-box keys-modal-box">
+        <div class="modal-header">
+          <h3>Personal Access Tokens (MCP & API)</h3>
+          <button class="btn-icon-tiny" onclick="app.closeModal('apiKeysModal')">✕</button>
+        </div>
+        <div class="modal-body">
+          <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 16px;">
+            Use API tokens to connect AI agents (Cursor, Claude Desktop, Claude Code, Cline) to RemGo via the Model Context Protocol (MCP) or programmatic REST API.
+          </p>
+
+          <!-- Create Token Form -->
+          <div class="create-key-box">
+            <input type="text" id="newKeyNameInput" class="form-input" placeholder="Token description (e.g. Cursor MCP)">
+            <button class="btn btn-sm btn-primary" onclick="app.createAPIKey()">
+              <span>Generate Token</span>
+            </button>
+          </div>
+
+          <!-- Newly Generated Token Display (Dismissable) -->
+          <div id="newKeyDisplayBox" class="new-key-display hidden">
+            <div class="new-key-header">
+              <span>⚠️ Copy your Personal Access Token now. You won't be able to see it again!</span>
+            </div>
+            <div class="new-key-row">
+              <code id="newKeyText"></code>
+              <button class="btn btn-sm" onclick="app.copyNewKey()">Copy</button>
+            </div>
+          </div>
+
+          <!-- Existing Keys Table -->
+          <div class="keys-list-section">
+            <h4 style="font-size:0.85rem; margin-bottom:8px; color:var(--text-secondary);">Active Tokens</h4>
+            <div id="keysList" class="keys-list">
+              <!-- Rendered dynamically -->
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-sm" onclick="app.closeModal('apiKeysModal')">Close</button>
+        </div>
+      </div>
+    </div>
+
   </div>
 
   <script src="/app.js"></script>

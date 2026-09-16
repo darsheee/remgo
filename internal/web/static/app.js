@@ -18,6 +18,13 @@ class RemGoApp {
     this.searchSelectedIndex = 0;
     this.searchResults = [];
 
+    // Authentication State
+    this.authEnabled = false;
+    this.hasUsers = false;
+    this.currentUser = null;
+    this.authMode = 'login'; // 'login', 'register', 'setup'
+    this.token = localStorage.getItem('remgo_token') || '';
+
     // Graph physics simulation
     this.graphData = null;
     this.graphNodes = [];
@@ -28,9 +35,51 @@ class RemGoApp {
     this.init();
   }
 
+  // Central authenticated fetch wrapper
+  async fetchAPI(url, options = {}) {
+    const headers = options.headers ? { ...options.headers } : {};
+    if (this.token) {
+      headers['Authorization'] = 'Bearer ' + this.token;
+    }
+
+    const mergedOptions = {
+      ...options,
+      headers
+    };
+
+    try {
+      const res = await fetch(url, mergedOptions);
+      if (res.status === 401 && this.authEnabled) {
+        this.handleUnauthorized();
+        return null;
+      }
+      return res;
+    } catch (e) {
+      console.error('Fetch error:', url, e);
+      throw e;
+    }
+  }
+
+  handleUnauthorized() {
+    this.token = '';
+    localStorage.removeItem('remgo_token');
+    this.currentUser = null;
+    this.updateUserProfileUI();
+    this.openAuthModal(this.hasUsers ? 'login' : 'setup');
+  }
+
   async init() {
     this.applyTheme(this.theme);
     this.bindGlobalShortcuts();
+
+    // Check Auth Status
+    await this.checkAuthStatus();
+
+    // If auth is required and user is not authenticated, stop here until login
+    if (this.authEnabled && !this.currentUser) {
+      return;
+    }
+
     await this.loadDocuments();
     await this.refreshDueBadge();
 
@@ -39,6 +88,316 @@ class RemGoApp {
       await this.zoomTo(this.documents[0].id);
     } else {
       await this.createNewDoc('Welcome to RemGo');
+    }
+  }
+
+  // Auth Status & User Profile
+  async checkAuthStatus() {
+    try {
+      const res = await this.fetchAPI('/api/auth/status');
+      if (!res || !res.ok) return;
+      const status = await res.json();
+      this.authEnabled = status.auth_enabled;
+      this.hasUsers = status.has_users;
+
+      if (status.authenticated && status.user) {
+        this.currentUser = status.user;
+      } else if (!this.authEnabled) {
+        this.currentUser = status.user || { username: 'default', role: 'local' };
+      } else {
+        this.currentUser = null;
+      }
+
+      this.updateUserProfileUI();
+
+      // If auth is enabled but not authenticated, trigger appropriate modal
+      if (this.authEnabled && !this.currentUser) {
+        if (!this.hasUsers) {
+          this.openAuthModal('setup');
+        } else {
+          this.openAuthModal('login');
+        }
+      }
+    } catch (e) {
+      console.error('Failed to check auth status', e);
+    }
+  }
+
+  updateUserProfileUI() {
+    const avatar = document.getElementById('userAvatar');
+    const name = document.getElementById('userName');
+    const role = document.getElementById('userRole');
+    const actionBtn = document.getElementById('authActionBtn');
+
+    if (this.currentUser) {
+      const uname = this.currentUser.username || 'User';
+      avatar.innerText = uname.charAt(0).toUpperCase();
+      name.innerText = uname;
+      role.innerText = this.currentUser.role ? (this.currentUser.role.charAt(0).toUpperCase() + this.currentUser.role.slice(1)) : 'Local';
+      actionBtn.title = 'Log Out';
+      actionBtn.innerHTML = '🚪';
+    } else {
+      avatar.innerText = '?';
+      name.innerText = 'Not signed in';
+      role.innerText = 'Guest';
+      actionBtn.title = 'Log In';
+      actionBtn.innerHTML = '🔑';
+    }
+  }
+
+  openAuthOrProfile() {
+    if (this.currentUser && this.authEnabled) {
+      this.openAPIKeysModal();
+    } else {
+      this.openAuthModal(this.hasUsers ? 'login' : 'setup');
+    }
+  }
+
+  handleAuthActionClick() {
+    if (this.currentUser && this.authEnabled) {
+      this.logout();
+    } else {
+      this.openAuthModal(this.hasUsers ? 'login' : 'setup');
+    }
+  }
+
+  // Auth Modal Management
+  openAuthModal(mode = 'login') {
+    this.authMode = mode;
+    const modal = document.getElementById('authModal');
+    const tabs = document.getElementById('authTabs');
+    const title = document.getElementById('authModalTitle');
+    const subtitle = document.getElementById('authModalSubtitle');
+    const submitBtn = document.getElementById('authSubmitBtn');
+    const emailGroup = document.getElementById('authEmailGroup');
+    const footer = document.getElementById('authFooter');
+    const alertBox = document.getElementById('authAlert');
+
+    alertBox.classList.add('hidden');
+    alertBox.innerText = '';
+
+    if (mode === 'setup') {
+      title.innerText = 'Create Admin Account';
+      subtitle.innerText = 'Welcome to RemGo! Setup your first administrator account.';
+      tabs.style.display = 'none';
+      emailGroup.style.display = 'block';
+      submitBtn.innerText = 'Create Admin Account';
+      footer.style.display = 'none';
+    } else if (mode === 'register') {
+      title.innerText = 'Create an Account';
+      subtitle.innerText = 'Sign up to start organizing notes and flashcards.';
+      tabs.style.display = 'flex';
+      emailGroup.style.display = 'block';
+      submitBtn.innerText = 'Sign Up';
+      footer.style.display = 'block';
+      document.getElementById('authTabLogin').classList.remove('active');
+      document.getElementById('authTabRegister').classList.add('active');
+      document.getElementById('authSwitchPrompt').innerText = 'Already have an account?';
+      document.getElementById('authSwitchLink').innerText = 'Log In';
+    } else {
+      // login
+      title.innerText = 'Welcome to RemGo';
+      subtitle.innerText = 'Sign in to access your notes and review schedules.';
+      tabs.style.display = 'flex';
+      emailGroup.style.display = 'none';
+      submitBtn.innerText = 'Log In';
+      footer.style.display = 'block';
+      document.getElementById('authTabLogin').classList.add('active');
+      document.getElementById('authTabRegister').classList.remove('active');
+      document.getElementById('authSwitchPrompt').innerText = "Don't have an account?";
+      document.getElementById('authSwitchLink').innerText = 'Create one';
+    }
+
+    modal.classList.remove('hidden');
+    document.getElementById('authUsername').focus();
+  }
+
+  switchAuthTab(tab) {
+    this.openAuthModal(tab);
+  }
+
+  toggleAuthMode() {
+    this.openAuthModal(this.authMode === 'login' ? 'register' : 'login');
+  }
+
+  async submitAuth(event) {
+    event.preventDefault();
+    const alertBox = document.getElementById('authAlert');
+    alertBox.classList.add('hidden');
+    alertBox.innerText = '';
+
+    const username = document.getElementById('authUsername').value.trim();
+    const email = document.getElementById('authEmail').value.trim();
+    const password = document.getElementById('authPassword').value;
+
+    let endpoint = '/api/auth/login';
+    let body = { username, password };
+
+    if (this.authMode === 'setup') {
+      endpoint = '/api/auth/setup';
+      body = { username, email: email || `${username}@remgo.local`, password };
+    } else if (this.authMode === 'register') {
+      endpoint = '/api/auth/register';
+      body = { username, email: email || `${username}@remgo.local`, password };
+    }
+
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        alertBox.innerText = data.error || 'Authentication failed';
+        alertBox.classList.remove('hidden');
+        return;
+      }
+
+      // Success!
+      this.token = data.token;
+      localStorage.setItem('remgo_token', data.token);
+      this.currentUser = data.user;
+      this.hasUsers = true;
+      this.updateUserProfileUI();
+      this.closeModal('authModal');
+
+      // Refresh application data
+      await this.loadDocuments();
+      await this.refreshDueBadge();
+      if (this.documents.length > 0) {
+        await this.zoomTo(this.documents[0].id);
+      } else {
+        await this.createNewDoc('Welcome to RemGo');
+      }
+    } catch (e) {
+      alertBox.innerText = 'Network error: ' + e.message;
+      alertBox.classList.remove('hidden');
+    }
+  }
+
+  async logout() {
+    try {
+      await this.fetchAPI('/api/auth/logout', { method: 'POST' });
+    } catch (e) {
+      console.error('Logout error', e);
+    }
+    this.token = '';
+    localStorage.removeItem('remgo_token');
+    this.currentUser = null;
+    this.documents = [];
+    this.currentTree = [];
+    this.currentRem = null;
+    this.updateUserProfileUI();
+    this.renderDocsList();
+    this.renderOutlinerTree([]);
+
+    if (this.authEnabled) {
+      this.openAuthModal('login');
+    } else {
+      await this.checkAuthStatus();
+      await this.loadDocuments();
+    }
+  }
+
+  // Personal Access Tokens (API Keys) Modal
+  async openAPIKeysModal() {
+    const modal = document.getElementById('apiKeysModal');
+    document.getElementById('newKeyDisplayBox').classList.add('hidden');
+    document.getElementById('newKeyNameInput').value = '';
+    modal.classList.remove('hidden');
+    await this.loadAPIKeys();
+  }
+
+  async loadAPIKeys() {
+    const list = document.getElementById('keysList');
+    list.innerHTML = '<div style="padding:12px;font-size:0.85rem;color:var(--text-muted);">Loading tokens...</div>';
+
+    try {
+      const res = await this.fetchAPI('/api/auth/keys');
+      if (!res || !res.ok) {
+        list.innerHTML = '<div style="padding:12px;font-size:0.85rem;color:var(--again-color);">Failed to load tokens</div>';
+        return;
+      }
+      const keys = await res.json();
+      if (!keys || keys.length === 0) {
+        list.innerHTML = '<div style="padding:12px;font-size:0.85rem;color:var(--text-muted);">No active tokens created yet.</div>';
+        return;
+      }
+
+      list.innerHTML = '';
+      keys.forEach(k => {
+        const item = document.createElement('div');
+        item.className = 'key-item';
+        const createdDate = new Date(k.created_at).toLocaleDateString();
+        const lastUsed = k.last_used_at ? new Date(k.last_used_at).toLocaleDateString() : 'Never';
+        item.innerHTML = `
+          <div class="key-item-info">
+            <span class="key-name">${this.escapeHTML(k.name)}</span>
+            <span class="key-prefix"><code>${this.escapeHTML(k.key_prefix)}</code></span>
+            <span class="key-meta">Created: ${createdDate} • Last used: ${lastUsed}</span>
+          </div>
+          <button class="btn btn-sm btn-danger" onclick="app.deleteAPIKey('${k.id}')">Revoke</button>
+        `;
+        list.appendChild(item);
+      });
+    } catch (e) {
+      console.error('Failed to load API keys', e);
+    }
+  }
+
+  async createAPIKey() {
+    const input = document.getElementById('newKeyNameInput');
+    const name = input.value.trim() || 'MCP Agent Token';
+
+    try {
+      const res = await this.fetchAPI('/api/auth/keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+      });
+
+      if (!res || !res.ok) {
+        alert('Failed to generate token');
+        return;
+      }
+
+      const data = await res.json();
+      input.value = '';
+
+      // Display newly created token
+      const displayBox = document.getElementById('newKeyDisplayBox');
+      const textEl = document.getElementById('newKeyText');
+      textEl.innerText = data.key;
+      this.lastGeneratedKey = data.key;
+      displayBox.classList.remove('hidden');
+
+      await this.loadAPIKeys();
+    } catch (e) {
+      alert('Error creating API key: ' + e.message);
+    }
+  }
+
+  async deleteAPIKey(keyID) {
+    if (!confirm('Are you sure you want to revoke this Personal Access Token? Any MCP agent using it will lose access.')) {
+      return;
+    }
+
+    try {
+      const res = await this.fetchAPI(`/api/auth/keys/${keyID}`, { method: 'DELETE' });
+      if (res && res.ok) {
+        await this.loadAPIKeys();
+      }
+    } catch (e) {
+      alert('Failed to revoke key: ' + e.message);
+    }
+  }
+
+  copyNewKey() {
+    if (this.lastGeneratedKey) {
+      navigator.clipboard.writeText(this.lastGeneratedKey);
+      alert('Token copied to clipboard!');
     }
   }
 
@@ -75,8 +434,8 @@ class RemGoApp {
   // Data Loading
   async loadDocuments() {
     try {
-      const res = await fetch('/api/tree');
-      if (!res.ok) return;
+      const res = await this.fetchAPI('/api/tree');
+      if (!res || !res.ok) return;
       this.documents = await res.json();
       this.renderDocsList();
     } catch (e) {
@@ -86,8 +445,8 @@ class RemGoApp {
 
   async refreshDueBadge() {
     try {
-      const res = await fetch('/api/cards/stats');
-      if (!res.ok) return;
+      const res = await this.fetchAPI('/api/cards/stats');
+      if (!res || !res.ok) return;
       const stats = await res.json();
       const badge = document.getElementById('dueBadge');
       if (badge) {
@@ -116,15 +475,15 @@ class RemGoApp {
 
   async createNewDoc(defaultTitle = 'Untitled Document') {
     try {
-      const res = await fetch('/api/rems', {
+      const res = await this.fetchAPI('/api/rems', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content: defaultTitle, parent_id: null })
       });
-      if (!res.ok) return;
+      if (!res || !res.ok) return;
       const doc = await res.json();
       // Add a starter child bullet
-      await fetch('/api/rems', {
+      await this.fetchAPI('/api/rems', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content: 'Welcome :: Type here to take notes', parent_id: doc.id })
@@ -146,7 +505,8 @@ class RemGoApp {
       // Home view
       this.breadcrumbs = [];
       this.renderBreadcrumbs();
-      const res = await fetch('/api/tree');
+      const res = await this.fetchAPI('/api/tree');
+      if (!res || !res.ok) return;
       this.currentTree = await res.json();
       document.getElementById('docTitleInput').value = 'All Documents';
       document.getElementById('docTitleInput').disabled = true;
@@ -157,14 +517,15 @@ class RemGoApp {
 
     try {
       // Fetch rem details + ancestors
-      const remRes = await fetch(`/api/rems/${remID}`);
-      if (!remRes.ok) return;
+      const remRes = await this.fetchAPI(`/api/rems/${remID}`);
+      if (!remRes || !remRes.ok) return;
       const data = await remRes.json();
       this.currentRem = data.rem;
       this.breadcrumbs = data.ancestors || [];
 
       // Fetch subtree
-      const treeRes = await fetch(`/api/tree?root_id=${remID}`);
+      const treeRes = await this.fetchAPI(`/api/tree?root_id=${remID}`);
+      if (!treeRes || !treeRes.ok) return;
       const tree = await treeRes.json();
       this.currentTree = (tree && tree.length > 0 && tree[0].children) ? tree[0].children : [];
 
@@ -326,7 +687,6 @@ class RemGoApp {
   }
 
   bindEditorEvents(editor, node) {
-    // Autosave on blur or input
     let timeout = null;
     editor.addEventListener('input', () => {
       clearTimeout(timeout);
@@ -334,28 +694,26 @@ class RemGoApp {
         const text = editor.innerText.trim();
         const remID = editor.dataset.id;
 
-        // Dynamically update card badge while typing
         const existingBadge = editor.parentElement.querySelector('.bullet-badge');
         if (existingBadge) existingBadge.remove();
         const newBadge = this.createCardBadge(text);
         if (newBadge) editor.parentElement.appendChild(newBadge);
 
         if (remID && remID !== 'new') {
-          await fetch(`/api/rems/${remID}`, {
+          await this.fetchAPI(`/api/rems/${remID}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ content: text })
           });
           this.refreshDueBadge();
         } else if (text !== '') {
-          // New starter bullet created
           const parentID = this.currentDocID;
-          const res = await fetch('/api/rems', {
+          const res = await this.fetchAPI('/api/rems', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ content: text, parent_id: parentID })
           });
-          if (res.ok) {
+          if (res && res.ok) {
             const newRem = await res.json();
             editor.dataset.id = newRem.id;
             node = newRem;
@@ -365,21 +723,19 @@ class RemGoApp {
       }, 300);
     });
 
-    // Keyboard navigation: Enter, Tab, Shift+Tab, Arrows, Backspace
     editor.addEventListener('keydown', async (e) => {
       const id = editor.dataset.id;
       if (!id || id === 'new') return;
 
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        // Create new sibling bullet immediately below using after_id
         const parentID = node?.parent_id || this.currentDocID;
-        const res = await fetch('/api/rems', {
+        const res = await this.fetchAPI('/api/rems', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content: '', parent_id: parentID, after_id: id })
         });
-        if (res.ok) {
+        if (res && res.ok) {
           const created = await res.json();
           await this.reloadCurrentView();
           this.focusEditorByID(created.id);
@@ -388,21 +744,20 @@ class RemGoApp {
         e.preventDefault();
         if (e.shiftKey) {
           // Outdent
-          const res = await fetch(`/api/rems/${id}/outdent`, { method: 'POST' });
-          if (res.ok) {
+          const res = await this.fetchAPI(`/api/rems/${id}/outdent`, { method: 'POST' });
+          if (res && res.ok) {
             await this.reloadCurrentView();
             this.focusEditorByID(id);
           }
         } else {
           // Indent
-          const res = await fetch(`/api/rems/${id}/indent`, { method: 'POST' });
-          if (res.ok) {
+          const res = await this.fetchAPI(`/api/rems/${id}/indent`, { method: 'POST' });
+          if (res && res.ok) {
             await this.reloadCurrentView();
             this.focusEditorByID(id);
           }
         }
       } else if (e.key === 'Backspace' && editor.innerText.trim() === '') {
-        // Delete empty bullet and preserve focus on predecessor
         e.preventDefault();
         const allEditors = Array.from(document.querySelectorAll('.bullet-editor'));
         const currentIdx = allEditors.indexOf(editor);
@@ -410,7 +765,7 @@ class RemGoApp {
         if (allEditors.length > 1 && currentIdx > 0) {
           prevID = allEditors[currentIdx - 1].dataset.id;
         }
-        await fetch(`/api/rems/${id}`, { method: 'DELETE' });
+        await this.fetchAPI(`/api/rems/${id}`, { method: 'DELETE' });
         await this.reloadCurrentView();
         if (prevID) {
           this.focusEditorByID(prevID);
@@ -438,7 +793,6 @@ class RemGoApp {
       const el = document.querySelector(`.bullet-editor[data-id="${id}"]`);
       if (el) {
         el.focus();
-        // Move caret to end
         const range = document.createRange();
         range.selectNodeContents(el);
         range.collapse(false);
@@ -451,8 +805,8 @@ class RemGoApp {
 
   async toggleCollapse(id, liElement) {
     try {
-      const res = await fetch(`/api/rems/${id}/toggle-collapse`, { method: 'POST' });
-      if (!res.ok) return;
+      const res = await this.fetchAPI(`/api/rems/${id}/toggle-collapse`, { method: 'POST' });
+      if (!res || !res.ok) return;
       const data = await res.json();
       const toggle = liElement.querySelector('.bullet-toggle');
       const childUl = liElement.querySelector('.bullet-children');
@@ -474,7 +828,7 @@ class RemGoApp {
     clearTimeout(this.titleTimeout);
     this.titleTimeout = setTimeout(async () => {
       try {
-        await fetch(`/api/rems/${this.currentDocID}`, {
+        await this.fetchAPI(`/api/rems/${this.currentDocID}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content: newTitle })
@@ -524,7 +878,8 @@ class RemGoApp {
 
     const endpoint = this.isCramMode ? '/api/cards/cram' : '/api/cards/due';
     try {
-      const res = await fetch(endpoint);
+      const res = await this.fetchAPI(endpoint);
+      if (!res || !res.ok) return;
       this.dueCards = await res.json();
       this.updateReviewerCounters();
       this.renderCurrentCard();
@@ -574,17 +929,11 @@ class RemGoApp {
     const card = this.dueCards[this.currentCardIndex];
     this.isAnswerRevealed = false;
 
-    // Breadcrumbs path
     crumbsEl.innerHTML = (card.breadcrumbs || []).map(b => this.escapeHTML(b)).join(' > ');
-
-    // Prompt
     promptEl.innerText = card.front;
-
-    // Answer
     answerEl.innerText = card.back;
     answerWrapper.style.display = 'none';
 
-    // Interval chips on rating buttons
     if (card.next_previews) {
       document.getElementById('rateAgainIntvl').innerText = card.next_previews.again.label;
       document.getElementById('rateHardIntvl').innerText = card.next_previews.hard.label;
@@ -610,7 +959,7 @@ class RemGoApp {
     const card = this.dueCards[this.currentCardIndex];
 
     try {
-      await fetch(`/api/cards/${card.id}/review`, {
+      await this.fetchAPI(`/api/cards/${card.id}/review`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rating: rating, is_cram: this.isCramMode })
@@ -633,7 +982,8 @@ class RemGoApp {
     canvas.height = rect.height;
 
     try {
-      const res = await fetch('/api/graph');
+      const res = await this.fetchAPI('/api/graph');
+      if (!res || !res.ok) return;
       this.graphData = await res.json();
     } catch (e) {
       console.error('Failed to load graph', e);
@@ -643,7 +993,6 @@ class RemGoApp {
     const width = canvas.width;
     const height = canvas.height;
 
-    // Initialize node positions in a circle
     const numNodes = this.graphData.nodes.length;
     this.graphNodes = this.graphData.nodes.map((n, i) => {
       const angle = (i / (numNodes || 1)) * Math.PI * 2;
@@ -667,7 +1016,6 @@ class RemGoApp {
       type: e.type
     })).filter(e => e.source !== undefined && e.target !== undefined);
 
-    // Mouse interactions
     canvas.onmousedown = (e) => {
       const mx = e.offsetX;
       const my = e.offsetY;
@@ -693,7 +1041,6 @@ class RemGoApp {
       if (this.dragNode) {
         const dist = Math.hypot(this.dragNode.vx, this.dragNode.vy);
         if (dist < 1) {
-          // Clicked node -> zoom into that Rem!
           this.zoomTo(this.dragNode.id);
         }
       }
@@ -737,7 +1084,7 @@ class RemGoApp {
         const targetDist = edge.type === 'reference' ? 120 : 70;
         const force = (dist - targetDist) * 0.005;
         if (n1 !== this.dragNode) { n1.vx += dx * force; n1.vy += dy * force; }
-        if (n2 !== this.dragNode) { n2.vx -= dx * force; n2.vy -= dy * force; }
+        if (n2 !== this.dragNode) { n2.vx += dx * force; n2.vy += dy * force; }
       }
 
       // 3. Center gravity & velocity dampening
@@ -776,7 +1123,6 @@ class RemGoApp {
         ctx.strokeStyle = '#1e293b';
         ctx.stroke();
 
-        // Label
         ctx.font = '11px sans-serif';
         ctx.fillStyle = '#94a3b8';
         ctx.textAlign = 'center';
@@ -796,14 +1142,14 @@ class RemGoApp {
   // Global Keyboard Shortcuts
   bindGlobalShortcuts() {
     window.addEventListener('keydown', (e) => {
-      // 1. Search Modal: Cmd+K / Ctrl+K
+      // Search Modal: Cmd+K / Ctrl+K
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         this.openSearchModal();
         return;
       }
 
-      // 2. View switching: Cmd+1, Cmd+2, Cmd+3
+      // View switching: Cmd+1, Cmd+2, Cmd+3
       if ((e.metaKey || e.ctrlKey) && e.key === '1') {
         e.preventDefault();
         this.switchView('outliner');
@@ -820,7 +1166,7 @@ class RemGoApp {
         return;
       }
 
-      // 3. Reviewer shortcuts: Space (reveal answer), 1, 2, 3, 4 (rating)
+      // Reviewer shortcuts: Space (reveal answer), 1, 2, 3, 4 (rating)
       if (this.activeView === 'reviewer' && !this.isModalOpen()) {
         if (e.code === 'Space' && !this.isAnswerRevealed) {
           e.preventDefault();
@@ -834,7 +1180,7 @@ class RemGoApp {
         }
       }
 
-      // 4. Modal ESC to close
+      // Modal ESC to close
       if (e.key === 'Escape') {
         this.closeAllModals();
       }
@@ -892,7 +1238,6 @@ class RemGoApp {
     this.searchSelectedIndex = 0;
 
     if (!trimmed) {
-      // Show recent documents
       list.innerHTML = `<div style="padding:12px 18px;font-size:0.8rem;color:var(--text-muted);">Recent Documents</div>`;
       this.documents.slice(0, 5).forEach(doc => {
         const item = document.createElement('div');
@@ -909,7 +1254,8 @@ class RemGoApp {
     }
 
     try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(trimmed)}`);
+      const res = await this.fetchAPI(`/api/search?q=${encodeURIComponent(trimmed)}`);
+      if (!res || !res.ok) return;
       const results = await res.json();
       if (!results || results.length === 0) {
         list.innerHTML = `<div style="padding:20px;text-align:center;color:var(--text-muted);">No matches found</div>`;
@@ -938,6 +1284,16 @@ class RemGoApp {
 
   // Export & Import Modal
   openImportExportModal() {
+    // Add token query parameter to export links if authenticated
+    const expMd = document.getElementById('exportMdLink');
+    const expJson = document.getElementById('exportJsonLink');
+    if (this.token) {
+      expMd.href = `/api/export?token=${encodeURIComponent(this.token)}`;
+      expJson.href = `/api/export?format=json&token=${encodeURIComponent(this.token)}`;
+    } else {
+      expMd.href = '/api/export';
+      expJson.href = '/api/export?format=json';
+    }
     document.getElementById('importExportModal').classList.remove('hidden');
   }
 
@@ -947,12 +1303,12 @@ class RemGoApp {
     if (!text) return;
 
     try {
-      const res = await fetch('/api/import', {
+      const res = await this.fetchAPI('/api/import', {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
         body: text
       });
-      if (res.ok) {
+      if (res && res.ok) {
         const data = await res.json();
         alert(data.message || 'Import successful!');
         this.closeModal('importExportModal');
@@ -967,19 +1323,33 @@ class RemGoApp {
   // Modal helpers
   isModalOpen() {
     return !document.getElementById('searchModal').classList.contains('hidden') ||
-           !document.getElementById('importExportModal').classList.contains('hidden');
+           !document.getElementById('importExportModal').classList.contains('hidden') ||
+           !document.getElementById('authModal').classList.contains('hidden') ||
+           !document.getElementById('apiKeysModal').classList.contains('hidden');
   }
 
   closeModal(modalID) {
-    document.getElementById(modalID).classList.add('hidden');
+    const m = document.getElementById(modalID);
+    if (m) m.classList.add('hidden');
   }
 
   closeAllModals() {
+    // If auth is required and user is not logged in, do not allow closing authModal
+    if (this.authEnabled && !this.currentUser) {
+      document.getElementById('searchModal').classList.add('hidden');
+      document.getElementById('importExportModal').classList.add('hidden');
+      document.getElementById('apiKeysModal').classList.add('hidden');
+      return;
+    }
     document.querySelectorAll('.modal-backdrop').forEach(m => m.classList.add('hidden'));
   }
 
   handleModalBackdropClick(event, modalID) {
     if (event.target.id === modalID) {
+      // Prevent dismissing auth modal if user is not authenticated in auth-enabled mode
+      if (modalID === 'authModal' && this.authEnabled && !this.currentUser) {
+        return;
+      }
       this.closeModal(modalID);
     }
   }

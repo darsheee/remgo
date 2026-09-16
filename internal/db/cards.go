@@ -12,20 +12,23 @@ import (
 )
 
 // syncCardsAndRefsTx synchronizes parsed cards and references inside an active transaction.
-func (d *DB) syncCardsAndRefsTx(tx *sql.Tx, rem *Rem) error {
+func (d *DB) syncCardsAndRefsTx(tx *sql.Tx, rem *Rem, userID string) error {
+	if userID == "" {
+		userID = DefaultUserID
+	}
 	parseResult := parser.ParseContent(rem.Content)
 	now := time.Now().UTC()
 
 	// 1. Sync References
-	if _, err := tx.Exec("DELETE FROM references_map WHERE source_rem_id = ?", rem.ID); err != nil {
+	if _, err := tx.Exec("DELETE FROM references_map WHERE source_rem_id = ? AND user_id = ?", rem.ID, userID); err != nil {
 		return fmt.Errorf("failed to clear old references: %w", err)
 	}
 
 	for _, ref := range parseResult.References {
 		var targetRemID sql.NullString
 		_ = tx.QueryRow(
-			"SELECT id FROM rems WHERE LOWER(content) LIKE LOWER(?) LIMIT 1",
-			ref.TargetTitle+"%",
+			"SELECT id FROM rems WHERE user_id = ? AND LOWER(content) LIKE LOWER(?) LIMIT 1",
+			userID, ref.TargetTitle+"%",
 		).Scan(&targetRemID)
 
 		refID := "ref_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
@@ -36,15 +39,15 @@ func (d *DB) syncCardsAndRefsTx(tx *sql.Tx, rem *Rem) error {
 		}
 
 		_, err := tx.Exec(
-			"INSERT INTO references_map(id, source_rem_id, target_title, target_rem_id, created_at) VALUES (?, ?, ?, ?, ?)",
-			refID, rem.ID, ref.TargetTitle, targetIDVal, now,
+			"INSERT INTO references_map(id, user_id, source_rem_id, target_title, target_rem_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+			refID, userID, rem.ID, ref.TargetTitle, targetIDVal, now,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to insert reference: %w", err)
 		}
 	}
 
-	// Resolve any existing unresolved references that target this Rem by title/concept
+	// Resolve any existing unresolved references for this user that target this Rem by title/concept
 	cleanTitle := parser.CleanDelimiters(rem.Content)
 	if parts := strings.SplitN(cleanTitle, "::", 2); len(parts) > 1 {
 		cleanTitle = strings.TrimSpace(parts[0])
@@ -57,8 +60,8 @@ func (d *DB) syncCardsAndRefsTx(tx *sql.Tx, rem *Rem) error {
 	}
 	if cleanTitle != "" {
 		_, _ = tx.Exec(
-			"UPDATE references_map SET target_rem_id = ? WHERE target_rem_id IS NULL AND LOWER(target_title) = LOWER(?)",
-			rem.ID, cleanTitle,
+			"UPDATE references_map SET target_rem_id = ? WHERE user_id = ? AND target_rem_id IS NULL AND LOWER(target_title) = LOWER(?)",
+			rem.ID, userID, cleanTitle,
 		)
 	}
 
@@ -66,7 +69,7 @@ func (d *DB) syncCardsAndRefsTx(tx *sql.Tx, rem *Rem) error {
 	// Populate multi-line list cards from child bullets if back is empty
 	for i := range parseResult.Cards {
 		if parseResult.Cards[i].Type == parser.CardTypeList && parseResult.Cards[i].Back == "" {
-			childRows, err := tx.Query("SELECT content FROM rems WHERE parent_id = ? ORDER BY sort_order ASC", rem.ID)
+			childRows, err := tx.Query("SELECT content FROM rems WHERE user_id = ? AND parent_id = ? ORDER BY sort_order ASC", userID, rem.ID)
 			if err == nil {
 				var items []string
 				for childRows.Next() {
@@ -104,8 +107,8 @@ func (d *DB) syncCardsAndRefsTx(tx *sql.Tx, rem *Rem) error {
 
 	var existingList []existingCard
 	rows, err := tx.Query(
-		"SELECT id, card_type, front, cloze_index FROM cards WHERE rem_id = ?",
-		rem.ID,
+		"SELECT id, card_type, front, cloze_index FROM cards WHERE rem_id = ? AND user_id = ?",
+		rem.ID, userID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to query existing cards: %w", err)
@@ -154,8 +157,8 @@ func (d *DB) syncCardsAndRefsTx(tx *sql.Tx, rem *Rem) error {
 		if matchedID != "" {
 			// Update text while preserving SRS memory statistics
 			_, err := tx.Exec(
-				"UPDATE cards SET front = ?, back = ?, hint = ? WHERE id = ?",
-				pc.Front, pc.Back, pc.Hint, matchedID,
+				"UPDATE cards SET front = ?, back = ?, hint = ? WHERE id = ? AND user_id = ?",
+				pc.Front, pc.Back, pc.Hint, matchedID, userID,
 			)
 			if err != nil {
 				return fmt.Errorf("failed to update existing card: %w", err)
@@ -169,10 +172,10 @@ func (d *DB) syncCardsAndRefsTx(tx *sql.Tx, rem *Rem) error {
 
 			_, err := tx.Exec(
 				`INSERT INTO cards(
-					id, rem_id, card_type, front, back, cloze_index, hint,
+					id, user_id, rem_id, card_type, front, back, cloze_index, hint,
 					state, stability, difficulty, reps, lapses, last_reviewed_at, due_at, created_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
-				cardID, rem.ID, string(pc.Type), pc.Front, pc.Back, pc.ClozeIndex, pc.Hint,
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+				cardID, userID, rem.ID, string(pc.Type), pc.Front, pc.Back, pc.ClozeIndex, pc.Hint,
 				int(srs.StateNew), initStab, initDiff, 0, 0, now, now,
 			)
 			if err != nil {
@@ -185,7 +188,7 @@ func (d *DB) syncCardsAndRefsTx(tx *sql.Tx, rem *Rem) error {
 	// Delete obsolete cards that no longer exist in parsed content
 	for _, ec := range existingList {
 		if !matchedCardIDs[ec.id] {
-			if _, err := tx.Exec("DELETE FROM cards WHERE id = ?", ec.id); err != nil {
+			if _, err := tx.Exec("DELETE FROM cards WHERE id = ? AND user_id = ?", ec.id, userID); err != nil {
 				return fmt.Errorf("failed to delete obsolete card: %w", err)
 			}
 		}
@@ -194,8 +197,11 @@ func (d *DB) syncCardsAndRefsTx(tx *sql.Tx, rem *Rem) error {
 	return nil
 }
 
-// GetDueCards returns flashcards that are due for review.
-func (d *DB) GetDueCards(limit int) ([]*CardWithRem, error) {
+// GetDueCards returns flashcards that are due for review for a specific user.
+func (d *DB) GetDueCards(userID string, limit int) ([]*CardWithRem, error) {
+	if userID == "" {
+		userID = DefaultUserID
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -208,15 +214,15 @@ func (d *DB) GetDueCards(limit int) ([]*CardWithRem, error) {
 	endOfToday := startOfToday.Add(24 * time.Hour)
 
 	query := `
-	SELECT c.id, c.rem_id, r.content, c.card_type, c.front, c.back, c.cloze_index, c.hint,
+	SELECT c.id, c.user_id, c.rem_id, r.content, c.card_type, c.front, c.back, c.cloze_index, c.hint,
 	       c.state, c.stability, c.difficulty, c.reps, c.lapses, c.last_reviewed_at, c.due_at, c.created_at
 	FROM cards c
 	JOIN rems r ON c.rem_id = r.id
-	WHERE c.due_at <= ?
+	WHERE c.user_id = ? AND c.due_at <= ?
 	ORDER BY c.state DESC, c.due_at ASC
 	LIMIT ?;`
 
-	rows, err := d.sqlDB.Query(query, endOfToday, limit)
+	rows, err := d.sqlDB.Query(query, userID, endOfToday, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query due cards: %w", err)
 	}
@@ -229,7 +235,7 @@ func (d *DB) GetDueCards(limit int) ([]*CardWithRem, error) {
 		var stateInt int
 
 		err := rows.Scan(
-			&c.ID, &c.RemID, &c.RemContent, &c.CardType, &c.Front, &c.Back, &c.ClozeIndex, &c.Hint,
+			&c.ID, &c.UserID, &c.RemID, &c.RemContent, &c.CardType, &c.Front, &c.Back, &c.ClozeIndex, &c.Hint,
 			&stateInt, &c.Stability, &c.Difficulty, &c.Reps, &c.Lapses, &lastRev, &c.DueAt, &c.CreatedAt,
 		)
 		if err != nil {
@@ -243,7 +249,6 @@ func (d *DB) GetDueCards(limit int) ([]*CardWithRem, error) {
 			c.LastReviewedAt = &t
 		}
 
-		// Calculate interval previews for 1, 2, 3, 4
 		cardRec := srs.CardRecord{
 			ID:             c.ID,
 			State:          c.State,
@@ -258,7 +263,7 @@ func (d *DB) GetDueCards(limit int) ([]*CardWithRem, error) {
 		c.NextPreviews = &previews
 
 		// Breadcrumbs
-		ancestors, _ := d.getAncestorsInternal(c.RemID)
+		ancestors, _ := d.getAncestorsInternal(userID, c.RemID)
 		for _, a := range ancestors {
 			if a.ID != c.RemID {
 				c.Breadcrumbs = append(c.Breadcrumbs, parser.CleanDelimiters(a.Content))
@@ -271,8 +276,11 @@ func (d *DB) GetDueCards(limit int) ([]*CardWithRem, error) {
 	return cards, nil
 }
 
-// GetCramCards returns cards for on-demand practice without due date constraints.
-func (d *DB) GetCramCards(remID *string, limit int) ([]*CardWithRem, error) {
+// GetCramCards returns cards for on-demand practice for a user without due date constraints.
+func (d *DB) GetCramCards(userID string, remID *string, limit int) ([]*CardWithRem, error) {
+	if userID == "" {
+		userID = DefaultUserID
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -286,28 +294,29 @@ func (d *DB) GetCramCards(remID *string, limit int) ([]*CardWithRem, error) {
 
 	if remID == nil {
 		query = `
-		SELECT c.id, c.rem_id, r.content, c.card_type, c.front, c.back, c.cloze_index, c.hint,
+		SELECT c.id, c.user_id, c.rem_id, r.content, c.card_type, c.front, c.back, c.cloze_index, c.hint,
 		       c.state, c.stability, c.difficulty, c.reps, c.lapses, c.last_reviewed_at, c.due_at, c.created_at
 		FROM cards c
 		JOIN rems r ON c.rem_id = r.id
+		WHERE c.user_id = ?
 		ORDER BY RANDOM()
 		LIMIT ?;`
-		args = append(args, limit)
+		args = append(args, userID, limit)
 	} else {
 		query = `
 		WITH RECURSIVE rem_sub AS (
-			SELECT id FROM rems WHERE id = ?
+			SELECT id FROM rems WHERE id = ? AND user_id = ?
 			UNION ALL
-			SELECT r.id FROM rems r JOIN rem_sub s ON r.parent_id = s.id
+			SELECT r.id FROM rems r JOIN rem_sub s ON r.parent_id = s.id WHERE r.user_id = ?
 		)
-		SELECT c.id, c.rem_id, r.content, c.card_type, c.front, c.back, c.cloze_index, c.hint,
+		SELECT c.id, c.user_id, c.rem_id, r.content, c.card_type, c.front, c.back, c.cloze_index, c.hint,
 		       c.state, c.stability, c.difficulty, c.reps, c.lapses, c.last_reviewed_at, c.due_at, c.created_at
 		FROM cards c
 		JOIN rems r ON c.rem_id = r.id
-		WHERE c.rem_id IN (SELECT id FROM rem_sub)
+		WHERE c.user_id = ? AND c.rem_id IN (SELECT id FROM rem_sub)
 		ORDER BY RANDOM()
 		LIMIT ?;`
-		args = append(args, *remID, limit)
+		args = append(args, *remID, userID, userID, userID, limit)
 	}
 
 	rows, err := d.sqlDB.Query(query, args...)
@@ -323,7 +332,7 @@ func (d *DB) GetCramCards(remID *string, limit int) ([]*CardWithRem, error) {
 		var stateInt int
 
 		err := rows.Scan(
-			&c.ID, &c.RemID, &c.RemContent, &c.CardType, &c.Front, &c.Back, &c.ClozeIndex, &c.Hint,
+			&c.ID, &c.UserID, &c.RemID, &c.RemContent, &c.CardType, &c.Front, &c.Back, &c.ClozeIndex, &c.Hint,
 			&stateInt, &c.Stability, &c.Difficulty, &c.Reps, &c.Lapses, &lastRev, &c.DueAt, &c.CreatedAt,
 		)
 		if err != nil {
@@ -350,7 +359,7 @@ func (d *DB) GetCramCards(remID *string, limit int) ([]*CardWithRem, error) {
 		previews := d.srs.PreviewRatings(cardRec, now)
 		c.NextPreviews = &previews
 
-		ancestors, _ := d.getAncestorsInternal(c.RemID)
+		ancestors, _ := d.getAncestorsInternal(userID, c.RemID)
 		for _, a := range ancestors {
 			if a.ID != c.RemID {
 				c.Breadcrumbs = append(c.Breadcrumbs, parser.CleanDelimiters(a.Content))
@@ -363,8 +372,11 @@ func (d *DB) GetCramCards(remID *string, limit int) ([]*CardWithRem, error) {
 	return cards, nil
 }
 
-// ReviewCard processes user recall rating and saves the result to the database.
-func (d *DB) ReviewCard(cardID string, rating srs.Rating, isCram bool) (*srs.ReviewResult, error) {
+// ReviewCard processes user recall rating and saves the result to the database for a user.
+func (d *DB) ReviewCard(userID string, cardID string, rating srs.Rating, isCram bool) (*srs.ReviewResult, error) {
+	if userID == "" {
+		userID = DefaultUserID
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -373,8 +385,8 @@ func (d *DB) ReviewCard(cardID string, rating srs.Rating, isCram bool) (*srs.Rev
 	var lastRev sql.NullTime
 
 	err := d.sqlDB.QueryRow(
-		"SELECT id, state, stability, difficulty, reps, lapses, last_reviewed_at, due_at FROM cards WHERE id = ?",
-		cardID,
+		"SELECT id, state, stability, difficulty, reps, lapses, last_reviewed_at, due_at FROM cards WHERE id = ? AND user_id = ?",
+		cardID, userID,
 	).Scan(&rec.ID, &stateInt, &rec.Stability, &rec.Difficulty, &rec.Reps, &rec.Lapses, &lastRev, &rec.DueAt)
 	if err != nil {
 		return nil, fmt.Errorf("card not found: %s", cardID)
@@ -404,10 +416,10 @@ func (d *DB) ReviewCard(cardID string, rating srs.Rating, isCram bool) (*srs.Rev
 	// Insert review log
 	_, err = tx.Exec(
 		`INSERT INTO card_reviews(
-			id, card_id, rating, state, stability, difficulty,
+			id, user_id, card_id, rating, state, stability, difficulty,
 			elapsed_days, scheduled_days, reviewed_at, is_cram
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		reviewLogID, cardID, int(rating), int(result.Card.State), result.Card.Stability, result.Card.Difficulty,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		reviewLogID, userID, cardID, int(rating), int(result.Card.State), result.Card.Stability, result.Card.Difficulty,
 		result.ElapsedDays, result.ScheduledDays, now, cramInt,
 	)
 	if err != nil {
@@ -418,9 +430,9 @@ func (d *DB) ReviewCard(cardID string, rating srs.Rating, isCram bool) (*srs.Rev
 	if !isCram {
 		_, err = tx.Exec(
 			`UPDATE cards SET state = ?, stability = ?, difficulty = ?, reps = ?, lapses = ?, last_reviewed_at = ?, due_at = ?
-			WHERE id = ?`,
+			WHERE id = ? AND user_id = ?`,
 			int(result.Card.State), result.Card.Stability, result.Card.Difficulty,
-			result.Card.Reps, result.Card.Lapses, now, result.Card.DueAt, cardID,
+			result.Card.Reps, result.Card.Lapses, now, result.Card.DueAt, cardID, userID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to update card srs state: %w", err)
@@ -434,8 +446,11 @@ func (d *DB) ReviewCard(cardID string, rating srs.Rating, isCram bool) (*srs.Rev
 	return &result, nil
 }
 
-// GetCardStats calculates aggregate statistics on cards and reviews.
-func (d *DB) GetCardStats() (*CardStats, error) {
+// GetCardStats calculates aggregate statistics on cards and reviews for a user.
+func (d *DB) GetCardStats(userID string) (*CardStats, error) {
+	if userID == "" {
+		userID = DefaultUserID
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -444,12 +459,12 @@ func (d *DB) GetCardStats() (*CardStats, error) {
 	startOfToday := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	endOfToday := startOfToday.Add(24 * time.Hour)
 
-	_ = d.sqlDB.QueryRow("SELECT COUNT(*) FROM cards").Scan(&stats.TotalCards)
-	_ = d.sqlDB.QueryRow("SELECT COUNT(*) FROM cards WHERE state = ?", int(srs.StateNew)).Scan(&stats.NewCards)
-	_ = d.sqlDB.QueryRow("SELECT COUNT(*) FROM cards WHERE state IN (?, ?)", int(srs.StateLearning), int(srs.StateRelearning)).Scan(&stats.LearningCards)
-	_ = d.sqlDB.QueryRow("SELECT COUNT(*) FROM cards WHERE state = ?", int(srs.StateReview)).Scan(&stats.ReviewCards)
-	_ = d.sqlDB.QueryRow("SELECT COUNT(*) FROM cards WHERE due_at <= ?", endOfToday).Scan(&stats.DueToday)
-	_ = d.sqlDB.QueryRow("SELECT COUNT(*) FROM card_reviews WHERE reviewed_at >= ? AND reviewed_at < ?", startOfToday, endOfToday).Scan(&stats.ReviewedToday)
+	_ = d.sqlDB.QueryRow("SELECT COUNT(*) FROM cards WHERE user_id = ?", userID).Scan(&stats.TotalCards)
+	_ = d.sqlDB.QueryRow("SELECT COUNT(*) FROM cards WHERE user_id = ? AND state = ?", userID, int(srs.StateNew)).Scan(&stats.NewCards)
+	_ = d.sqlDB.QueryRow("SELECT COUNT(*) FROM cards WHERE user_id = ? AND state IN (?, ?)", userID, int(srs.StateLearning), int(srs.StateRelearning)).Scan(&stats.LearningCards)
+	_ = d.sqlDB.QueryRow("SELECT COUNT(*) FROM cards WHERE user_id = ? AND state = ?", userID, int(srs.StateReview)).Scan(&stats.ReviewCards)
+	_ = d.sqlDB.QueryRow("SELECT COUNT(*) FROM cards WHERE user_id = ? AND due_at <= ?", userID, endOfToday).Scan(&stats.DueToday)
+	_ = d.sqlDB.QueryRow("SELECT COUNT(*) FROM card_reviews WHERE user_id = ? AND reviewed_at >= ? AND reviewed_at < ?", userID, startOfToday, endOfToday).Scan(&stats.ReviewedToday)
 
 	return &stats, nil
 }

@@ -9,7 +9,7 @@ import (
 	"github.com/darsheee/remgo/internal/db"
 )
 
-func setupTestMCP(t *testing.T) *Server {
+func setupTestMCP(t *testing.T) (*Server, *db.DB) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "mcp_test.db")
 	database, err := db.Open(dbPath)
@@ -19,11 +19,11 @@ func setupTestMCP(t *testing.T) *Server {
 	t.Cleanup(func() {
 		database.Close()
 	})
-	return NewServer(database)
+	return NewServer(database), database
 }
 
 func TestMCPInitializeAndToolsList(t *testing.T) {
-	srv := setupTestMCP(t)
+	srv, _ := setupTestMCP(t)
 
 	// 1. Test initialize
 	initReq := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
@@ -62,7 +62,7 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 }
 
 func TestMCPToolExecutionWorkflow(t *testing.T) {
-	srv := setupTestMCP(t)
+	srv, _ := setupTestMCP(t)
 
 	// 1. Create Rem via MCP tool call
 	createReq := `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_rem","arguments":{"content":"FSRS :: Free Spaced Repetition Scheduler"}}}`
@@ -132,7 +132,7 @@ func TestMCPToolExecutionWorkflow(t *testing.T) {
 }
 
 func TestMCPNotificationHandling(t *testing.T) {
-	srv := setupTestMCP(t)
+	srv, _ := setupTestMCP(t)
 
 	// JSON-RPC 2.0 notification (no ID) must return nil
 	notifReq := `{"jsonrpc":"2.0","method":"notifications/initialized"}`
@@ -155,3 +155,44 @@ func TestMCPNotificationHandling(t *testing.T) {
 	}
 }
 
+func TestMCPMultiUserIsolation(t *testing.T) {
+	srv, database := setupTestMCP(t)
+
+	userAlice, _ := database.CreateUser("alice_mcp", "alice@mcp.dev", "alicepass123", "")
+	userBob, _ := database.CreateUser("bob_mcp", "bob@mcp.dev", "bobpass123", "")
+
+	// 1. Alice creates a rem via MCP
+	aliceReq := `{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"create_rem","arguments":{"content":"Alice Secret Strategy :: Plan A"}}}`
+	respRaw, err := srv.HandleMessageForUser([]byte(aliceReq), userAlice.ID)
+	if err != nil {
+		t.Fatalf("Alice MCP create failed: %v", err)
+	}
+	if strings.Contains(string(respRaw), `"isError":true`) {
+		t.Fatalf("Alice MCP error: %s", string(respRaw))
+	}
+
+	// 2. Bob searches for "Strategy" via MCP -> must return 0 results
+	bobReq := `{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"search_rems","arguments":{"query":"Strategy"}}}`
+	bobRespRaw, err := srv.HandleMessageForUser([]byte(bobReq), userBob.ID)
+	if err != nil {
+		t.Fatalf("Bob MCP search failed: %v", err)
+	}
+	var bobSearch struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+	}
+	json.Unmarshal(bobRespRaw, &bobSearch)
+	if len(bobSearch.Result.Content) == 0 || bobSearch.Result.Content[0].Text != "null" && bobSearch.Result.Content[0].Text != "[]" {
+		t.Fatalf("Bob should not see Alice's notes: %s", bobSearch.Result.Content[0].Text)
+	}
+
+	// 3. Alice searches for "Strategy" via MCP -> must find it
+	aliceSearchReq := `{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"search_rems","arguments":{"query":"Strategy"}}}`
+	aliceSearchRespRaw, _ := srv.HandleMessageForUser([]byte(aliceSearchReq), userAlice.ID)
+	if !strings.Contains(string(aliceSearchRespRaw), "Alice Secret Strategy") {
+		t.Fatalf("Alice should see her own notes: %s", string(aliceSearchRespRaw))
+	}
+}

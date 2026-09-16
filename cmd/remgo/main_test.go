@@ -26,7 +26,8 @@ func TestEndToEndServer(t *testing.T) {
 	seedInitialNotesIfEmpty(database)
 
 	staticHandler := web.Handler()
-	apiServer := api.NewServer(database, staticHandler)
+	// Single-user mode (auth disabled)
+	apiServer := api.NewServer(database, staticHandler, false)
 	ts := httptest.NewServer(apiServer.Handler())
 	defer ts.Close()
 
@@ -104,5 +105,71 @@ func TestEndToEndServer(t *testing.T) {
 
 	if len(mcpResp.Result.Content) == 0 || !strings.Contains(mcpResp.Result.Content[0].Text, "Powerhouse of the cell") {
 		t.Fatalf("MCP search result missing Mitochondria, got %+v", mcpResp)
+	}
+}
+
+func TestEndToEndServerWithAuth(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "e2e_auth_remgo.db")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer database.Close()
+
+	staticHandler := web.Handler()
+	// Multi-user mode with auth forced
+	apiServer := api.NewServer(database, staticHandler, true)
+	ts := httptest.NewServer(apiServer.Handler())
+	defer ts.Close()
+
+	// 1. Root and static assets are always accessible
+	res, err := http.Get(ts.URL + "/")
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("failed to GET /: %v", err)
+	}
+
+	// 2. Protected API returns 401
+	pRes, err := http.Get(ts.URL + "/api/tree")
+	if err != nil || pRes.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on /api/tree, got %d", pRes.StatusCode)
+	}
+
+	// 3. Status returns auth_enabled: true, has_users: false
+	sRes, err := http.Get(ts.URL + "/api/auth/status")
+	if err != nil || sRes.StatusCode != http.StatusOK {
+		t.Fatalf("failed to GET /api/auth/status: %v", err)
+	}
+	var status struct {
+		AuthEnabled bool `json:"auth_enabled"`
+		HasUsers    bool `json:"has_users"`
+	}
+	json.NewDecoder(sRes.Body).Decode(&status)
+	if !status.AuthEnabled || status.HasUsers {
+		t.Fatalf("unexpected status: %+v", status)
+	}
+
+	// 4. Setup first admin account
+	setupReq := `{"username":"admin", "email":"admin@example.com", "password":"adminpassword123"}`
+	setRes, err := http.Post(ts.URL+"/api/auth/setup", "application/json", strings.NewReader(setupReq))
+	if err != nil || setRes.StatusCode != http.StatusCreated {
+		t.Fatalf("failed to setup admin: %v", err)
+	}
+
+	var setupResult struct {
+		Token string `json:"token"`
+	}
+	json.NewDecoder(setRes.Body).Decode(&setupResult)
+	if setupResult.Token == "" {
+		t.Fatalf("empty token returned from setup")
+	}
+
+	// 5. Access protected API using Bearer token
+	req, _ := http.NewRequest("GET", ts.URL+"/api/tree", nil)
+	req.Header.Set("Authorization", "Bearer "+setupResult.Token)
+	client := &http.Client{}
+	tRes, err := client.Do(req)
+	if err != nil || tRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 with Bearer token, got %d", tRes.StatusCode)
 	}
 }

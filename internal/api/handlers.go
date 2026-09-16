@@ -1,46 +1,89 @@
 package api
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 
+	"github.com/darsheee/remgo/internal/auth"
 	"github.com/darsheee/remgo/internal/db"
 	"github.com/darsheee/remgo/internal/mcp"
 	"github.com/darsheee/remgo/internal/srs"
 )
 
-// Server handles all REST API and MCP HTTP endpoints.
+// Server handles all REST API, MCP HTTP, and authentication endpoints.
 type Server struct {
-	db        *db.DB
-	mcpServer *mcp.Server
-	mux       *http.ServeMux
+	db          *db.DB
+	mcpServer   *mcp.Server
+	mux         *http.ServeMux
+	authEnabled bool
+	jwtSecret   []byte
 }
 
 // NewServer initializes the HTTP API server.
-func NewServer(database *db.DB, staticHandler http.Handler) *Server {
+func NewServer(database *db.DB, staticHandler http.Handler, authEnabled ...bool) *Server {
+	enabled := false
+	if len(authEnabled) > 0 {
+		enabled = authEnabled[0]
+	}
+
+	secret := []byte(os.Getenv("REMGO_JWT_SECRET"))
+	if len(secret) == 0 {
+		secret = make([]byte, 32)
+		_, _ = rand.Read(secret)
+	}
+
 	s := &Server{
-		db:        database,
-		mcpServer: mcp.NewServer(database),
-		mux:       http.NewServeMux(),
+		db:          database,
+		mcpServer:   mcp.NewServer(database),
+		mux:         http.NewServeMux(),
+		authEnabled: enabled,
+		jwtSecret:   secret,
 	}
 
 	s.registerRoutes(staticHandler)
 	return s
 }
 
-// Handler returns the top-level http.Handler with CORS enabled.
+// IsAuthEnabled returns true if authentication is required.
+func (s *Server) IsAuthEnabled() bool {
+	return s.authEnabled
+}
+
+// Handler returns the top-level http.Handler with CORS and auth enforcement.
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
+		}
+
+		// Auth Gatekeeper for protected API routes when auth is enabled
+		if s.authEnabled {
+			path := r.URL.Path
+			isAuthEndpoint := strings.HasPrefix(path, "/api/auth/status") ||
+				strings.HasPrefix(path, "/api/auth/login") ||
+				strings.HasPrefix(path, "/api/auth/register") ||
+				strings.HasPrefix(path, "/api/auth/setup")
+
+			isProtectedAPI := (strings.HasPrefix(path, "/api/") && !isAuthEndpoint) || strings.HasPrefix(path, "/mcp")
+
+			if isProtectedAPI {
+				user := s.getUser(r)
+				if user == nil || user.ID == db.DefaultUserID {
+					writeError(w, http.StatusUnauthorized, "unauthorized: authentication required")
+					return
+				}
+			}
 		}
 
 		s.mux.ServeHTTP(w, r)
@@ -48,6 +91,17 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) registerRoutes(staticHandler http.Handler) {
+	// Authentication endpoints
+	s.mux.HandleFunc("GET /api/auth/status", s.handleAuthStatus)
+	s.mux.HandleFunc("POST /api/auth/setup", s.handleAuthSetup)
+	s.mux.HandleFunc("POST /api/auth/register", s.handleAuthRegister)
+	s.mux.HandleFunc("POST /api/auth/login", s.handleAuthLogin)
+	s.mux.HandleFunc("POST /api/auth/logout", s.handleAuthLogout)
+	s.mux.HandleFunc("GET /api/auth/me", s.handleAuthMe)
+	s.mux.HandleFunc("GET /api/auth/keys", s.handleListAPIKeys)
+	s.mux.HandleFunc("POST /api/auth/keys", s.handleCreateAPIKey)
+	s.mux.HandleFunc("DELETE /api/auth/keys/{id}", s.handleDeleteAPIKey)
+
 	// Rems endpoints
 	s.mux.HandleFunc("GET /api/rems", s.handleListRems)
 	s.mux.HandleFunc("POST /api/rems", s.handleCreateRem)
@@ -97,9 +151,89 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
+func (s *Server) extractRawToken(r *http.Request) string {
+	// 1. Authorization: Bearer <token>
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			return strings.TrimSpace(parts[1])
+		}
+	}
+
+	// 2. X-API-Key: <key>
+	if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
+		return strings.TrimSpace(apiKey)
+	}
+
+	// 3. Cookie: remgo_token
+	if cookie, err := r.Cookie("remgo_token"); err == nil && cookie.Value != "" {
+		return cookie.Value
+	}
+
+	// 4. URL query param (for SSE and exports): ?api_key=... or ?token=...
+	if qKey := r.URL.Query().Get("api_key"); qKey != "" {
+		return qKey
+	}
+	if qToken := r.URL.Query().Get("token"); qToken != "" {
+		return qToken
+	}
+
+	return ""
+}
+
+func (s *Server) getUser(r *http.Request) *db.User {
+	token := s.extractRawToken(r)
+	if token != "" {
+		// Try Personal Access Token (remgo_pat_...)
+		if strings.HasPrefix(token, "remgo_pat_") {
+			user, _, err := s.db.ValidateAPIKey(token)
+			if err == nil && user != nil {
+				return user
+			}
+		}
+
+		// Try JWT
+		if strings.Count(token, ".") == 2 {
+			claims, err := auth.ValidateJWT(s.jwtSecret, token)
+			if err == nil && claims != nil {
+				user, err := s.db.GetUserByID(claims.UserID)
+				if err == nil && user != nil {
+					return user
+				}
+			}
+		}
+
+		// Try Session token
+		user, _, err := s.db.ValidateSession(token)
+		if err == nil && user != nil {
+			return user
+		}
+	}
+
+	// If auth is not enabled, default to single-user default account
+	if !s.authEnabled {
+		return &db.User{
+			ID:        db.DefaultUserID,
+			Username:  db.DefaultUsername,
+			Role:      "admin",
+		}
+	}
+
+	return nil
+}
+
+func (s *Server) getUserID(r *http.Request) string {
+	u := s.getUser(r)
+	if u != nil {
+		return u.ID
+	}
+	return db.DefaultUserID
+}
+
 // Handlers
 func (s *Server) handleListRems(w http.ResponseWriter, r *http.Request) {
-	tree, err := s.db.GetTree(nil)
+	userID := s.getUserID(r)
+	tree, err := s.db.GetTree(userID, nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -108,6 +242,7 @@ func (s *Server) handleListRems(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateRem(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	var body struct {
 		Content   *string `json:"content"`
 		ParentID  *string `json:"parent_id"`
@@ -128,9 +263,9 @@ func (s *Server) handleCreateRem(w http.ResponseWriter, r *http.Request) {
 	var err error
 
 	if body.AfterID != nil && *body.AfterID != "" {
-		rem, err = s.db.CreateRemAfter(*body.AfterID, content)
+		rem, err = s.db.CreateRemAfter(userID, *body.AfterID, content)
 	} else {
-		rem, err = s.db.CreateRem(body.ParentID, content, body.SortOrder)
+		rem, err = s.db.CreateRem(userID, body.ParentID, content, body.SortOrder)
 	}
 
 	if err != nil {
@@ -141,8 +276,9 @@ func (s *Server) handleCreateRem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetRem(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	id := r.PathValue("id")
-	rem, err := s.db.GetRem(id)
+	rem, err := s.db.GetRem(userID, id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -152,8 +288,8 @@ func (s *Server) handleGetRem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ancestors, _ := s.db.GetAncestors(id)
-	backlinks, _ := s.db.GetBacklinks(id)
+	ancestors, _ := s.db.GetAncestors(userID, id)
+	backlinks, _ := s.db.GetBacklinks(userID, id)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"rem":       rem,
@@ -163,6 +299,7 @@ func (s *Server) handleGetRem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdateRem(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	id := r.PathValue("id")
 	var body struct {
 		Content   *string `json:"content"`
@@ -173,7 +310,7 @@ func (s *Server) handleUpdateRem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rem, err := s.db.UpdateRem(id, body.Content, body.Collapsed)
+	rem, err := s.db.UpdateRem(userID, id, body.Content, body.Collapsed)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -182,8 +319,9 @@ func (s *Server) handleUpdateRem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteRem(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	id := r.PathValue("id")
-	if err := s.db.DeleteRem(id); err != nil {
+	if err := s.db.DeleteRem(userID, id); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -191,8 +329,9 @@ func (s *Server) handleDeleteRem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleIndentRem(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	id := r.PathValue("id")
-	if err := s.db.IndentRem(id); err != nil {
+	if err := s.db.IndentRem(userID, id); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -200,8 +339,9 @@ func (s *Server) handleIndentRem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleOutdentRem(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	id := r.PathValue("id")
-	if err := s.db.OutdentRem(id); err != nil {
+	if err := s.db.OutdentRem(userID, id); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -209,6 +349,7 @@ func (s *Server) handleOutdentRem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMoveRem(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	id := r.PathValue("id")
 	var body struct {
 		TargetParentID *string `json:"target_parent_id"`
@@ -218,7 +359,7 @@ func (s *Server) handleMoveRem(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if err := s.db.MoveRem(id, body.TargetParentID, body.SortOrder); err != nil {
+	if err := s.db.MoveRem(userID, id, body.TargetParentID, body.SortOrder); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -226,8 +367,9 @@ func (s *Server) handleMoveRem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleToggleCollapse(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	id := r.PathValue("id")
-	collapsed, err := s.db.ToggleCollapse(id)
+	collapsed, err := s.db.ToggleCollapse(userID, id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -236,11 +378,12 @@ func (s *Server) handleToggleCollapse(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetTree(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	var rootID *string
 	if q := r.URL.Query().Get("root_id"); q != "" {
 		rootID = &q
 	}
-	tree, err := s.db.GetTree(rootID)
+	tree, err := s.db.GetTree(userID, rootID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -249,6 +392,7 @@ func (s *Server) handleGetTree(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	q := r.URL.Query().Get("q")
 	limit := 20
 	if l := r.URL.Query().Get("limit"); l != "" {
@@ -256,7 +400,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			limit = val
 		}
 	}
-	results, err := s.db.Search(q, limit)
+	results, err := s.db.Search(userID, q, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -265,12 +409,13 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetBacklinks(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	target := r.URL.Query().Get("target")
 	if target == "" {
 		writeError(w, http.StatusBadRequest, "target query parameter required")
 		return
 	}
-	backlinks, err := s.db.GetBacklinks(target)
+	backlinks, err := s.db.GetBacklinks(userID, target)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -279,7 +424,8 @@ func (s *Server) handleGetBacklinks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetGraph(w http.ResponseWriter, r *http.Request) {
-	graph, err := s.db.GetGraphData()
+	userID := s.getUserID(r)
+	graph, err := s.db.GetGraphData(userID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -288,13 +434,14 @@ func (s *Server) handleGetGraph(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetDueCards(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	limit := 50
 	if l := r.URL.Query().Get("limit"); l != "" {
 		if val, err := strconv.Atoi(l); err == nil && val > 0 {
 			limit = val
 		}
 	}
-	cards, err := s.db.GetDueCards(limit)
+	cards, err := s.db.GetDueCards(userID, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -303,6 +450,7 @@ func (s *Server) handleGetDueCards(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetCramCards(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	var remID *string
 	if q := r.URL.Query().Get("rem_id"); q != "" {
 		remID = &q
@@ -313,7 +461,7 @@ func (s *Server) handleGetCramCards(w http.ResponseWriter, r *http.Request) {
 			limit = val
 		}
 	}
-	cards, err := s.db.GetCramCards(remID, limit)
+	cards, err := s.db.GetCramCards(userID, remID, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -322,6 +470,7 @@ func (s *Server) handleGetCramCards(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReviewCard(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	id := r.PathValue("id")
 	var body struct {
 		Rating int  `json:"rating"`
@@ -336,7 +485,7 @@ func (s *Server) handleReviewCard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.db.ReviewCard(id, srs.Rating(body.Rating), body.IsCram)
+	result, err := s.db.ReviewCard(userID, id, srs.Rating(body.Rating), body.IsCram)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -345,7 +494,8 @@ func (s *Server) handleReviewCard(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetCardStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.db.GetCardStats()
+	userID := s.getUserID(r)
+	stats, err := s.db.GetCardStats(userID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -354,9 +504,10 @@ func (s *Server) handleGetCardStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	format := r.URL.Query().Get("format")
 	if format == "json" {
-		tree, err := s.db.GetTree(nil)
+		tree, err := s.db.GetTree(userID, nil)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -368,14 +519,15 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=remgo_export.md")
-	if err := s.db.ExportMarkdown(w); err != nil {
+	if err := s.db.ExportMarkdown(userID, w); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 }
 
 func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
-	count, err := s.db.ImportMarkdown(r.Body)
+	userID := s.getUserID(r)
+	count, err := s.db.ImportMarkdown(userID, r.Body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("import failed: %v", err))
 		return
@@ -388,13 +540,14 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 
 // MCP JSON-RPC over HTTP
 func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "failed to read body")
 		return
 	}
 
-	respBytes, err := s.mcpServer.HandleMessage(body)
+	respBytes, err := s.mcpServer.HandleMessageForUser(body, userID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

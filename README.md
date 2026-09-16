@@ -100,6 +100,16 @@ remgo -port 9000 -data /path/to/notes
 
 Flags:
 ```text
+  -auth
+    	Force enable authentication (requires user login)
+  -no-auth
+    	Disable authentication (single-user mode)
+  -api-key string
+    	API key / PAT for MCP server authentication
+  -token string
+    	Bearer/Session token for MCP server authentication
+  -user string
+    	User ID or username for MCP server in local mode
   -data string
     	Directory to store SQLite database (default "./remgo_data")
   -host string
@@ -111,6 +121,27 @@ Flags:
   -version
     	Print version and exit
 ```
+
+CLI Commands:
+```bash
+# Create user account from CLI
+remgo create-user -username admin -password secret -role admin
+
+# Create Personal Access Token for MCP agents
+remgo create-pat -user admin -name "Cursor MCP"
+```
+
+---
+
+## 🔒 Authentication & Multi-Tenancy
+
+RemGo supports production-grade multi-tenancy inspired by tools like **PocketBase** and **Grafana**:
+
+- **Zero-Friction Single-User Mode**: Run with `--no-auth` (or auto-mode before any users exist) for immediate, login-free local note-taking.
+- **Multi-Tenant Isolation**: Each user's notes, flashcards, review histories, and references are completely private and scoped by `user_id`.
+- **First-User Admin Bootstrap**: When running with `--auth` on a fresh database, RemGo prompts to create the initial administrator account. Any existing starter notes from single-user mode are automatically adopted by the newly created admin.
+- **Sessions & JWT**: Secure cryptographic session tokens and HS256 JWTs stored in `HttpOnly` cookies and supported via `Authorization: Bearer <token>`.
+- **Personal Access Tokens (PAT)**: Generate `remgo_pat_...` keys in the web UI or CLI for AI agents (Claude Desktop, Cursor, Cline) to authenticate with the MCP server.
 
 ---
 
@@ -203,6 +234,18 @@ Add this to your `claude_desktop_config.json`:
 RemGo exposes a clean, zero-latency HTTP JSON API:
 
 ```
+# Authentication
+GET    /api/auth/status        # Check auth mode and login state
+POST   /api/auth/setup         # Bootstrap initial admin account
+POST   /api/auth/register      # Register new account
+POST   /api/auth/login         # Log in (sets cookie & returns token)
+POST   /api/auth/logout        # Terminate active session
+GET    /api/auth/me            # Get current user profile
+GET    /api/auth/keys          # List Personal Access Tokens
+POST   /api/auth/keys          # Create Personal Access Token
+DELETE /api/auth/keys/{id}     # Revoke Personal Access Token
+
+# Outliner & Documents
 GET    /api/tree               # Full outliner tree (optional ?root_id=...)
 POST   /api/rems               # Create Rem {"content": "...", "parent_id": "..."}
 GET    /api/rems/{id}          # Get Rem details, ancestors, and backlinks
@@ -212,17 +255,21 @@ POST   /api/rems/{id}/indent   # Indent bullet under preceding sibling
 POST   /api/rems/{id}/outdent  # Outdent bullet to parent level
 POST   /api/rems/{id}/move     # Reorder sibling bullets
 
+# Search & Graph
 GET    /api/search?q=...       # Full-text search (FTS5)
 GET    /api/graph              # Knowledge graph nodes & edges
 
+# Spaced Repetition (FSRS)
 GET    /api/cards/due          # Fetch due flashcard queue
 GET    /api/cards/cram         # Fetch flashcards for cram practice
 POST   /api/cards/{id}/review  # Submit review rating {"rating": 1-4, "is_cram": bool}
 GET    /api/cards/stats        # Get SRS retention & review metrics
 
+# Backup & Interop
 GET    /api/export             # Export as Markdown (?format=json for JSON)
 POST   /api/import             # Import Markdown outline
 
+# Model Context Protocol (MCP)
 POST   /mcp                    # Model Context Protocol JSON-RPC over HTTP
 GET    /mcp/sse                # Model Context Protocol SSE stream
 ```

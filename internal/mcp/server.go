@@ -189,8 +189,17 @@ var availableTools = []ToolDefinition{
 	},
 }
 
-// HandleMessage parses and executes a single JSON-RPC message.
+// HandleMessage parses and executes a single JSON-RPC message using the default user.
 func (s *Server) HandleMessage(msg []byte) ([]byte, error) {
+	return s.HandleMessageForUser(msg, db.DefaultUserID)
+}
+
+// HandleMessageForUser parses and executes a single JSON-RPC message scoped to a specific user.
+func (s *Server) HandleMessageForUser(msg []byte, userID string) ([]byte, error) {
+	if userID == "" {
+		userID = db.DefaultUserID
+	}
+
 	var req JSONRPCRequest
 	if err := json.Unmarshal(msg, &req); err != nil {
 		return json.Marshal(JSONRPCResponse{
@@ -240,7 +249,7 @@ func (s *Server) HandleMessage(msg []byte) ([]byte, error) {
 			break
 		}
 
-		callRes := s.executeTool(params.Name, params.Arguments)
+		callRes := s.executeTool(userID, params.Name, params.Arguments)
 		resp.Result = callRes
 
 	default:
@@ -250,7 +259,7 @@ func (s *Server) HandleMessage(msg []byte) ([]byte, error) {
 	return json.Marshal(resp)
 }
 
-func (s *Server) executeTool(name string, argsRaw json.RawMessage) ToolCallResult {
+func (s *Server) executeTool(userID string, name string, argsRaw json.RawMessage) ToolCallResult {
 	switch name {
 	case "search_rems":
 		var args struct {
@@ -258,7 +267,7 @@ func (s *Server) executeTool(name string, argsRaw json.RawMessage) ToolCallResul
 			Limit int    `json:"limit"`
 		}
 		_ = json.Unmarshal(argsRaw, &args)
-		res, err := s.db.Search(args.Query, args.Limit)
+		res, err := s.db.Search(userID, args.Query, args.Limit)
 		if err != nil {
 			return toolError(err.Error())
 		}
@@ -276,9 +285,9 @@ func (s *Server) executeTool(name string, argsRaw json.RawMessage) ToolCallResul
 		var rem *db.Rem
 		var err error
 		if args.AfterID != nil && *args.AfterID != "" {
-			rem, err = s.db.CreateRemAfter(*args.AfterID, args.Content)
+			rem, err = s.db.CreateRemAfter(userID, *args.AfterID, args.Content)
 		} else {
-			rem, err = s.db.CreateRem(args.ParentID, args.Content, nil)
+			rem, err = s.db.CreateRem(userID, args.ParentID, args.Content, nil)
 		}
 		if err != nil {
 			return toolError(err.Error())
@@ -292,14 +301,14 @@ func (s *Server) executeTool(name string, argsRaw json.RawMessage) ToolCallResul
 		if err := json.Unmarshal(argsRaw, &args); err != nil || args.ID == "" {
 			return toolError("id is required")
 		}
-		rem, err := s.db.GetRem(args.ID)
+		rem, err := s.db.GetRem(userID, args.ID)
 		if err != nil {
 			return toolError(err.Error())
 		}
 		if rem == nil {
 			return toolError("rem not found")
 		}
-		ancestors, _ := s.db.GetAncestors(args.ID)
+		ancestors, _ := s.db.GetAncestors(userID, args.ID)
 		return toolJSON(map[string]interface{}{
 			"rem":       rem,
 			"ancestors": ancestors,
@@ -314,13 +323,13 @@ func (s *Server) executeTool(name string, argsRaw json.RawMessage) ToolCallResul
 
 		if args.Format == "markdown" {
 			var buf bytes.Buffer
-			if err := s.db.ExportMarkdown(&buf); err != nil {
+			if err := s.db.ExportMarkdown(userID, &buf); err != nil {
 				return toolError(err.Error())
 			}
 			return ToolCallResult{Content: []ToolContent{{Type: "text", Text: buf.String()}}}
 		}
 
-		tree, err := s.db.GetTree(args.RootID)
+		tree, err := s.db.GetTree(userID, args.RootID)
 		if err != nil {
 			return toolError(err.Error())
 		}
@@ -335,7 +344,7 @@ func (s *Server) executeTool(name string, argsRaw json.RawMessage) ToolCallResul
 		if err := json.Unmarshal(argsRaw, &args); err != nil || args.ID == "" {
 			return toolError("id is required")
 		}
-		rem, err := s.db.UpdateRem(args.ID, args.Content, args.Collapsed)
+		rem, err := s.db.UpdateRem(userID, args.ID, args.Content, args.Collapsed)
 		if err != nil {
 			return toolError(err.Error())
 		}
@@ -348,7 +357,7 @@ func (s *Server) executeTool(name string, argsRaw json.RawMessage) ToolCallResul
 		if err := json.Unmarshal(argsRaw, &args); err != nil || args.ID == "" {
 			return toolError("id is required")
 		}
-		if err := s.db.DeleteRem(args.ID); err != nil {
+		if err := s.db.DeleteRem(userID, args.ID); err != nil {
 			return toolError(err.Error())
 		}
 		return toolText(fmt.Sprintf("Rem %s deleted successfully", args.ID))
@@ -358,7 +367,7 @@ func (s *Server) executeTool(name string, argsRaw json.RawMessage) ToolCallResul
 			Limit int `json:"limit"`
 		}
 		_ = json.Unmarshal(argsRaw, &args)
-		cards, err := s.db.GetDueCards(args.Limit)
+		cards, err := s.db.GetDueCards(userID, args.Limit)
 		if err != nil {
 			return toolError(err.Error())
 		}
@@ -373,7 +382,7 @@ func (s *Server) executeTool(name string, argsRaw json.RawMessage) ToolCallResul
 		if err := json.Unmarshal(argsRaw, &args); err != nil || args.CardID == "" {
 			return toolError("card_id and rating are required")
 		}
-		res, err := s.db.ReviewCard(args.CardID, srs.Rating(args.Rating), args.IsCram)
+		res, err := s.db.ReviewCard(userID, args.CardID, srs.Rating(args.Rating), args.IsCram)
 		if err != nil {
 			return toolError(err.Error())
 		}
@@ -386,14 +395,14 @@ func (s *Server) executeTool(name string, argsRaw json.RawMessage) ToolCallResul
 		if err := json.Unmarshal(argsRaw, &args); err != nil || args.Query == "" {
 			return toolError("query is required")
 		}
-		rems, err := s.db.GetBacklinks(args.Query)
+		rems, err := s.db.GetBacklinks(userID, args.Query)
 		if err != nil {
 			return toolError(err.Error())
 		}
 		return toolJSON(rems)
 
 	case "get_card_stats":
-		stats, err := s.db.GetCardStats()
+		stats, err := s.db.GetCardStats(userID)
 		if err != nil {
 			return toolError(err.Error())
 		}
@@ -425,7 +434,10 @@ func toolError(msg string) ToolCallResult {
 }
 
 // ServeStdio starts the MCP server over standard input and standard output.
-func (s *Server) ServeStdio() error {
+func (s *Server) ServeStdio(userID string) error {
+	if userID == "" {
+		userID = db.DefaultUserID
+	}
 	reader := bufio.NewReader(os.Stdin)
 	writer := bufio.NewWriter(os.Stdout)
 
@@ -434,7 +446,7 @@ func (s *Server) ServeStdio() error {
 		if len(line) > 0 {
 			trimmed := bytes.TrimSpace(line)
 			if len(trimmed) > 0 {
-				resp, err := s.HandleMessage(trimmed)
+				resp, err := s.HandleMessageForUser(trimmed, userID)
 				if err == nil && resp != nil {
 					writer.Write(resp)
 					writer.WriteByte('\n')

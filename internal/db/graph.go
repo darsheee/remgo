@@ -31,8 +31,11 @@ type GraphData struct {
 	Edges []GraphEdge `json:"edges"`
 }
 
-// GetGraphData builds the knowledge graph connecting Rems via hierarchy and references.
-func (d *DB) GetGraphData() (*GraphData, error) {
+// GetGraphData builds the knowledge graph connecting Rems via hierarchy and references for a user.
+func (d *DB) GetGraphData(userID string) (*GraphData, error) {
+	if userID == "" {
+		userID = DefaultUserID
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -43,9 +46,10 @@ func (d *DB) GetGraphData() (*GraphData, error) {
 	// 1. Fetch Rems
 	rows, err := d.sqlDB.Query(`
 		SELECT r.id, r.parent_id, r.content,
-		       (SELECT COUNT(*) FROM cards c WHERE c.rem_id = r.id) as card_count
-		FROM rems r;
-	`)
+		       (SELECT COUNT(*) FROM cards c WHERE c.rem_id = r.id AND c.user_id = ?) as card_count
+		FROM rems r
+		WHERE r.user_id = ?;
+	`, userID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query rems for graph: %w", err)
 	}
@@ -101,7 +105,8 @@ func (d *DB) GetGraphData() (*GraphData, error) {
 	refRows, err := d.sqlDB.Query(`
 		SELECT source_rem_id, target_rem_id, target_title
 		FROM references_map
-	`)
+		WHERE user_id = ?
+	`, userID)
 	if err == nil {
 		defer refRows.Close()
 		for refRows.Next() {
@@ -127,9 +132,12 @@ func (d *DB) GetGraphData() (*GraphData, error) {
 	}, nil
 }
 
-// ExportMarkdown exports all documents and trees as a clean markdown file.
-func (d *DB) ExportMarkdown(w io.Writer) error {
-	tree, err := d.GetTree(nil)
+// ExportMarkdown exports all documents and trees for a user as a clean markdown file.
+func (d *DB) ExportMarkdown(userID string, w io.Writer) error {
+	if userID == "" {
+		userID = DefaultUserID
+	}
+	tree, err := d.GetTree(userID, nil)
 	if err != nil {
 		return err
 	}
@@ -157,8 +165,11 @@ func (d *DB) ExportMarkdown(w io.Writer) error {
 	return nil
 }
 
-// ImportMarkdown imports a Markdown outline where indentation represents hierarchy.
-func (d *DB) ImportMarkdown(r io.Reader) (int, error) {
+// ImportMarkdown imports a Markdown outline where indentation represents hierarchy for a user.
+func (d *DB) ImportMarkdown(userID string, r io.Reader) (int, error) {
+	if userID == "" {
+		userID = DefaultUserID
+	}
 	scanner := bufio.NewScanner(r)
 	type stackItem struct {
 		id    string
@@ -206,7 +217,7 @@ func (d *DB) ImportMarkdown(r io.Reader) (int, error) {
 			parentID = &p
 		}
 
-		rem, err := d.CreateRem(parentID, content, nil)
+		rem, err := d.CreateRem(userID, parentID, content, nil)
 		if err != nil {
 			return count, err
 		}
