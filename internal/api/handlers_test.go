@@ -140,3 +140,92 @@ func TestAPIExportImport(t *testing.T) {
 		t.Fatalf("exported markdown missing Root Topic: %s", wExp.Body.String())
 	}
 }
+
+func TestAPICreateRemEmptyAndAfter(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	handler := srv.Handler()
+
+	// 1. Create root doc
+	docReq := httptest.NewRequest("POST", "/api/rems", strings.NewReader(`{"content":"My Doc"}`))
+	docReq.Header.Set("Content-Type", "application/json")
+	wDoc := httptest.NewRecorder()
+	handler.ServeHTTP(wDoc, docReq)
+	var doc db.Rem
+	json.Unmarshal(wDoc.Body.Bytes(), &doc)
+
+	// 2. Create bullet 1
+	b1Req := httptest.NewRequest("POST", "/api/rems", strings.NewReader(`{"content":"Item 1", "parent_id":"`+doc.ID+`"}`))
+	b1Req.Header.Set("Content-Type", "application/json")
+	wB1 := httptest.NewRecorder()
+	handler.ServeHTTP(wB1, b1Req)
+	var b1 db.Rem
+	json.Unmarshal(wB1.Body.Bytes(), &b1)
+
+	// 3. Create empty bullet after bullet 1
+	b2Req := httptest.NewRequest("POST", "/api/rems", strings.NewReader(`{"content":"", "parent_id":"`+doc.ID+`", "after_id":"`+b1.ID+`"}`))
+	b2Req.Header.Set("Content-Type", "application/json")
+	wB2 := httptest.NewRecorder()
+	handler.ServeHTTP(wB2, b2Req)
+
+	if wB2.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", wB2.Code)
+	}
+	var b2 db.Rem
+	json.Unmarshal(wB2.Body.Bytes(), &b2)
+	if b2.Content != "" {
+		t.Errorf("expected empty content, got '%s'", b2.Content)
+	}
+
+	// 4. Verify tree order
+	treeReq := httptest.NewRequest("GET", "/api/tree?root_id="+doc.ID, nil)
+	wTree := httptest.NewRecorder()
+	handler.ServeHTTP(wTree, treeReq)
+	var tree []*db.RemTreeNode
+	json.Unmarshal(wTree.Body.Bytes(), &tree)
+
+	if len(tree) != 1 || len(tree[0].Children) != 2 {
+		t.Fatalf("expected 2 children, got %+v", tree)
+	}
+	if tree[0].Children[0].ID != b1.ID || tree[0].Children[1].ID != b2.ID {
+		t.Errorf("wrong order: [0]=%s, [1]=%s", tree[0].Children[0].ID, tree[0].Children[1].ID)
+	}
+}
+
+func TestAPIGetRemBacklinks(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	handler := srv.Handler()
+
+	// Create Target Rem
+	targetReq := httptest.NewRequest("POST", "/api/rems", strings.NewReader(`{"content":"Go Lang :: Modern language"}`))
+	targetReq.Header.Set("Content-Type", "application/json")
+	wTarget := httptest.NewRecorder()
+	handler.ServeHTTP(wTarget, targetReq)
+	var target db.Rem
+	json.Unmarshal(wTarget.Body.Bytes(), &target)
+
+	// Create Source Rem referencing Target Rem
+	srcReq := httptest.NewRequest("POST", "/api/rems", strings.NewReader(`{"content":"We use [[Go Lang]] for backend"}`))
+	srcReq.Header.Set("Content-Type", "application/json")
+	wSrc := httptest.NewRecorder()
+	handler.ServeHTTP(wSrc, srcReq)
+
+	// Fetch Target Rem details
+	getReq := httptest.NewRequest("GET", "/api/rems/"+target.ID, nil)
+	wGet := httptest.NewRecorder()
+	handler.ServeHTTP(wGet, getReq)
+
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", wGet.Code)
+	}
+
+	var res struct {
+		Rem       *db.Rem   `json:"rem"`
+		Backlinks []*db.Rem `json:"backlinks"`
+	}
+	json.Unmarshal(wGet.Body.Bytes(), &res)
+
+	if len(res.Backlinks) != 1 {
+		t.Fatalf("expected 1 backlink to Go Lang, got %d", len(res.Backlinks))
+	}
+}
+

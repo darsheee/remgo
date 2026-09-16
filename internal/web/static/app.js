@@ -332,8 +332,16 @@ class RemGoApp {
       clearTimeout(timeout);
       timeout = setTimeout(async () => {
         const text = editor.innerText.trim();
-        if (node && node.id) {
-          await fetch(`/api/rems/${node.id}`, {
+        const remID = editor.dataset.id;
+
+        // Dynamically update card badge while typing
+        const existingBadge = editor.parentElement.querySelector('.bullet-badge');
+        if (existingBadge) existingBadge.remove();
+        const newBadge = this.createCardBadge(text);
+        if (newBadge) editor.parentElement.appendChild(newBadge);
+
+        if (remID && remID !== 'new') {
+          await fetch(`/api/rems/${remID}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ content: text })
@@ -350,6 +358,7 @@ class RemGoApp {
           if (res.ok) {
             const newRem = await res.json();
             editor.dataset.id = newRem.id;
+            node = newRem;
             this.refreshDueBadge();
           }
         }
@@ -363,23 +372,17 @@ class RemGoApp {
 
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        // Create new sibling bullet immediately below
+        // Create new sibling bullet immediately below using after_id
         const parentID = node?.parent_id || this.currentDocID;
         const res = await fetch('/api/rems', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: '', parent_id: parentID })
+          body: JSON.stringify({ content: '', parent_id: parentID, after_id: id })
         });
         if (res.ok) {
+          const created = await res.json();
           await this.reloadCurrentView();
-          // Focus new bullet
-          setTimeout(() => {
-            const allEditors = Array.from(document.querySelectorAll('.bullet-editor'));
-            const currentIdx = allEditors.indexOf(editor);
-            if (currentIdx !== -1 && currentIdx + 1 < allEditors.length) {
-              allEditors[currentIdx + 1].focus();
-            }
-          }, 50);
+          this.focusEditorByID(created.id);
         }
       } else if (e.key === 'Tab') {
         e.preventDefault();
@@ -399,15 +402,19 @@ class RemGoApp {
           }
         }
       } else if (e.key === 'Backspace' && editor.innerText.trim() === '') {
-        // Delete empty bullet
+        // Delete empty bullet and preserve focus on predecessor
         e.preventDefault();
         const allEditors = Array.from(document.querySelectorAll('.bullet-editor'));
         const currentIdx = allEditors.indexOf(editor);
+        let prevID = null;
         if (allEditors.length > 1 && currentIdx > 0) {
-          allEditors[currentIdx - 1].focus();
+          prevID = allEditors[currentIdx - 1].dataset.id;
         }
         await fetch(`/api/rems/${id}`, { method: 'DELETE' });
         await this.reloadCurrentView();
+        if (prevID) {
+          this.focusEditorByID(prevID);
+        }
       } else if (e.key === 'ArrowUp') {
         const allEditors = Array.from(document.querySelectorAll('.bullet-editor'));
         const idx = allEditors.indexOf(editor);
@@ -462,18 +469,21 @@ class RemGoApp {
     }
   }
 
-  async onTitleChange(newTitle) {
+  onTitleChange(newTitle) {
     if (!this.currentDocID) return;
-    try {
-      await fetch(`/api/rems/${this.currentDocID}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: newTitle })
-      });
-      await this.loadDocuments();
-    } catch (e) {
-      console.error('Failed to update title', e);
-    }
+    clearTimeout(this.titleTimeout);
+    this.titleTimeout = setTimeout(async () => {
+      try {
+        await fetch(`/api/rems/${this.currentDocID}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: newTitle })
+        });
+        await this.loadDocuments();
+      } catch (e) {
+        console.error('Failed to update title', e);
+      }
+    }, 300);
   }
 
   renderBacklinks(backlinks) {
@@ -837,14 +847,49 @@ class RemGoApp {
     modal.classList.remove('hidden');
     const input = document.getElementById('searchInput');
     input.value = '';
+    this.searchSelectedIndex = 0;
     input.focus();
+
+    input.onkeydown = (e) => {
+      const items = Array.from(document.querySelectorAll('.search-item'));
+      if (items.length === 0) return;
+
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        this.searchSelectedIndex = (this.searchSelectedIndex + 1) % items.length;
+        this.updateSearchSelection();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        this.searchSelectedIndex = (this.searchSelectedIndex - 1 + items.length) % items.length;
+        this.updateSearchSelection();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (items[this.searchSelectedIndex]) {
+          items[this.searchSelectedIndex].click();
+        }
+      }
+    };
+
     this.onSearchInput('');
+  }
+
+  updateSearchSelection() {
+    const items = Array.from(document.querySelectorAll('.search-item'));
+    items.forEach((it, idx) => {
+      if (idx === this.searchSelectedIndex) {
+        it.classList.add('selected');
+        it.scrollIntoView({ block: 'nearest' });
+      } else {
+        it.classList.remove('selected');
+      }
+    });
   }
 
   async onSearchInput(val) {
     const trimmed = val.trim();
     const list = document.getElementById('searchResultsList');
     list.innerHTML = '';
+    this.searchSelectedIndex = 0;
 
     if (!trimmed) {
       // Show recent documents
@@ -859,6 +904,7 @@ class RemGoApp {
         item.innerHTML = `<span class="search-item-title">${this.escapeHTML(doc.content)}</span>`;
         list.appendChild(item);
       });
+      this.updateSearchSelection();
       return;
     }
 
@@ -884,6 +930,7 @@ class RemGoApp {
         `;
         list.appendChild(item);
       });
+      this.updateSearchSelection();
     } catch (e) {
       console.error('Search failed', e);
     }

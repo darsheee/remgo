@@ -18,9 +18,20 @@ func (d *DB) CreateRem(parentID *string, content string, sortOrder *int) (*Rem, 
 	now := time.Now().UTC()
 	id := "rem_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
 
+	tx, err := d.sqlDB.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
 	var order int
 	if sortOrder != nil {
 		order = *sortOrder
+		if parentID == nil {
+			_, _ = tx.Exec("UPDATE rems SET sort_order = sort_order + 1 WHERE parent_id IS NULL AND sort_order >= ?", order)
+		} else {
+			_, _ = tx.Exec("UPDATE rems SET sort_order = sort_order + 1 WHERE parent_id = ? AND sort_order >= ?", *parentID, order)
+		}
 	} else {
 		// Calculate next sort order at current level
 		var maxOrder sql.NullInt64
@@ -32,19 +43,13 @@ func (d *DB) CreateRem(parentID *string, content string, sortOrder *int) (*Rem, 
 			query = "SELECT MAX(sort_order) FROM rems WHERE parent_id = ?"
 			args = append(args, *parentID)
 		}
-		_ = d.sqlDB.QueryRow(query, args...).Scan(&maxOrder)
+		_ = tx.QueryRow(query, args...).Scan(&maxOrder)
 		if maxOrder.Valid {
 			order = int(maxOrder.Int64) + 1
 		} else {
 			order = 0
 		}
 	}
-
-	tx, err := d.sqlDB.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
 
 	_, err = tx.Exec(
 		"INSERT INTO rems(id, parent_id, content, collapsed, sort_order, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)",
@@ -66,6 +71,83 @@ func (d *DB) CreateRem(parentID *string, content string, sortOrder *int) (*Rem, 
 
 	if err := d.syncCardsAndRefsTx(tx, rem); err != nil {
 		return nil, fmt.Errorf("failed to sync cards: %w", err)
+	}
+
+	// If parent has ==> list cards, re-sync parent to include new child
+	if parentID != nil {
+		var parentContent string
+		if err := tx.QueryRow("SELECT content FROM rems WHERE id = ?", *parentID).Scan(&parentContent); err == nil {
+			if strings.Contains(parentContent, "==>") {
+				pRem := &Rem{ID: *parentID, Content: parentContent}
+				_ = d.syncCardsAndRefsTx(tx, pRem)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return rem, nil
+}
+
+// CreateRemAfter inserts a new Rem immediately after the specified sibling Rem.
+func (d *DB) CreateRemAfter(afterRemID string, content string) (*Rem, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	prevRem, err := d.getRemInternal(afterRemID)
+	if err != nil || prevRem == nil {
+		return nil, fmt.Errorf("rem not found: %s", afterRemID)
+	}
+
+	now := time.Now().UTC()
+	id := "rem_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+	order := prevRem.SortOrder + 1
+
+	tx, err := d.sqlDB.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if prevRem.ParentID == nil {
+		_, _ = tx.Exec("UPDATE rems SET sort_order = sort_order + 1 WHERE parent_id IS NULL AND sort_order >= ?", order)
+	} else {
+		_, _ = tx.Exec("UPDATE rems SET sort_order = sort_order + 1 WHERE parent_id = ? AND sort_order >= ?", *prevRem.ParentID, order)
+	}
+
+	_, err = tx.Exec(
+		"INSERT INTO rems(id, parent_id, content, collapsed, sort_order, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)",
+		id, prevRem.ParentID, content, order, now, now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert rem: %w", err)
+	}
+
+	rem := &Rem{
+		ID:        id,
+		ParentID:  prevRem.ParentID,
+		Content:   content,
+		Collapsed: false,
+		SortOrder: order,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if err := d.syncCardsAndRefsTx(tx, rem); err != nil {
+		return nil, fmt.Errorf("failed to sync cards: %w", err)
+	}
+
+	// If parent has ==> list cards, re-sync parent to include new child
+	if prevRem.ParentID != nil {
+		var parentContent string
+		if err := tx.QueryRow("SELECT content FROM rems WHERE id = ?", *prevRem.ParentID).Scan(&parentContent); err == nil {
+			if strings.Contains(parentContent, "==>") {
+				pRem := &Rem{ID: *prevRem.ParentID, Content: parentContent}
+				_ = d.syncCardsAndRefsTx(tx, pRem)
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -150,6 +232,16 @@ func (d *DB) UpdateRem(id string, content *string, collapsed *bool) (*Rem, error
 		if err := d.syncCardsAndRefsTx(tx, rem); err != nil {
 			return nil, fmt.Errorf("failed to sync cards: %w", err)
 		}
+		// If this rem is a child of a list card (==>), re-sync the parent
+		if rem.ParentID != nil {
+			var parentContent string
+			if err := tx.QueryRow("SELECT content FROM rems WHERE id = ?", *rem.ParentID).Scan(&parentContent); err == nil {
+				if strings.Contains(parentContent, "==>") {
+					pRem := &Rem{ID: *rem.ParentID, Content: parentContent}
+					_ = d.syncCardsAndRefsTx(tx, pRem)
+				}
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -159,12 +251,29 @@ func (d *DB) UpdateRem(id string, content *string, collapsed *bool) (*Rem, error
 	return rem, nil
 }
 
-// DeleteRem removes a Rem and all child bullets recursively (handled by ON DELETE CASCADE).
+// DeleteRem removes a Rem and all child bullets recursively.
 func (d *DB) DeleteRem(id string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	res, err := d.sqlDB.Exec("DELETE FROM rems WHERE id = ?", id)
+	var parentID sql.NullString
+	_ = d.sqlDB.QueryRow("SELECT parent_id FROM rems WHERE id = ?", id).Scan(&parentID)
+
+	tx, err := d.sqlDB.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin delete tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	query := `
+	WITH RECURSIVE rem_sub AS (
+		SELECT id FROM rems WHERE id = ?
+		UNION ALL
+		SELECT r.id FROM rems r JOIN rem_sub s ON r.parent_id = s.id
+	)
+	DELETE FROM rems WHERE id IN (SELECT id FROM rem_sub);`
+
+	res, err := tx.Exec(query, id)
 	if err != nil {
 		return fmt.Errorf("failed to delete rem: %w", err)
 	}
@@ -172,7 +281,18 @@ func (d *DB) DeleteRem(id string) error {
 	if rows == 0 {
 		return fmt.Errorf("rem not found: %s", id)
 	}
-	return nil
+
+	if parentID.Valid {
+		var pContent string
+		if err := tx.QueryRow("SELECT content FROM rems WHERE id = ?", parentID.String).Scan(&pContent); err == nil {
+			if strings.Contains(pContent, "==>") {
+				pRem := &Rem{ID: parentID.String, Content: pContent}
+				_ = d.syncCardsAndRefsTx(tx, pRem)
+			}
+		}
+	}
+
+	return tx.Commit()
 }
 
 // IndentRem moves a Rem to be the child of its immediately preceding sibling.
@@ -214,14 +334,35 @@ func (d *DB) IndentRem(id string) error {
 	}
 
 	now := time.Now().UTC()
-	_, err = d.sqlDB.Exec(
+	tx, err := d.sqlDB.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin indent tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(
 		"UPDATE rems SET parent_id = ?, sort_order = ?, updated_at = ? WHERE id = ?",
 		prevID, newOrder, now, id,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update parent during indent: %w", err)
 	}
-	return nil
+
+	// Re-sync previous parent if it had ==> list cards
+	if rem.ParentID != nil {
+		var oldPContent string
+		if err := tx.QueryRow("SELECT content FROM rems WHERE id = ?", *rem.ParentID).Scan(&oldPContent); err == nil && strings.Contains(oldPContent, "==>") {
+			_ = d.syncCardsAndRefsTx(tx, &Rem{ID: *rem.ParentID, Content: oldPContent})
+		}
+	}
+
+	// Re-sync new parent if it has ==> list cards
+	var newPContent string
+	if err := tx.QueryRow("SELECT content FROM rems WHERE id = ?", prevID).Scan(&newPContent); err == nil && strings.Contains(newPContent, "==>") {
+		_ = d.syncCardsAndRefsTx(tx, &Rem{ID: prevID, Content: newPContent})
+	}
+
+	return tx.Commit()
 }
 
 // OutdentRem moves a Rem to become the next sibling of its current parent.
@@ -267,6 +408,11 @@ func (d *DB) OutdentRem(id string) error {
 	)
 	if err != nil {
 		return fmt.Errorf("failed to outdent rem: %w", err)
+	}
+
+	// Re-sync parent if it has ==> list cards
+	if strings.Contains(parent.Content, "==>") {
+		_ = d.syncCardsAndRefsTx(tx, parent)
 	}
 
 	return tx.Commit()
@@ -480,10 +626,10 @@ func (d *DB) Search(query string, limit int) ([]*SearchResult, error) {
 	}
 
 	q := `
-	SELECT r.id, r.content, snippet(rems_fts, 0, '<b>', '</b>', '...', 12) as snippet, r.updated_at
+	SELECT r.id, r.content, snippet(f, 0, '<b>', '</b>', '...', 12) as snippet, r.updated_at
 	FROM rems_fts f
 	JOIN rems r ON f.rem_id = r.id
-	WHERE rems_fts MATCH ?
+	WHERE f MATCH ?
 	ORDER BY rank
 	LIMIT ?;`
 
@@ -525,14 +671,32 @@ func (d *DB) GetBacklinks(targetIDOrTitle string) ([]*Rem, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
+	cleanTitle := targetIDOrTitle
+	var remContent string
+	if err := d.sqlDB.QueryRow("SELECT content FROM rems WHERE id = ?", targetIDOrTitle).Scan(&remContent); err == nil {
+		cleanTitle = parser.CleanDelimiters(remContent)
+		if parts := strings.SplitN(cleanTitle, "::", 2); len(parts) > 1 {
+			cleanTitle = strings.TrimSpace(parts[0])
+		}
+		if parts := strings.SplitN(cleanTitle, ";;", 2); len(parts) > 1 {
+			cleanTitle = strings.TrimSpace(parts[0])
+		}
+		if parts := strings.SplitN(cleanTitle, "==>", 2); len(parts) > 1 {
+			cleanTitle = strings.TrimSpace(parts[0])
+		}
+	}
+
 	query := `
 	SELECT DISTINCT r.id, r.parent_id, r.content, r.collapsed, r.sort_order, r.created_at, r.updated_at
 	FROM references_map ref
 	JOIN rems r ON ref.source_rem_id = r.id
-	WHERE ref.target_rem_id = ? OR LOWER(ref.target_title) = LOWER(?)
+	WHERE ref.target_rem_id = ? 
+	   OR LOWER(ref.target_title) = LOWER(?)
+	   OR LOWER(ref.target_title) = LOWER(?)
+	   OR ref.target_rem_id IN (SELECT id FROM rems WHERE id = ?)
 	ORDER BY r.updated_at DESC;`
 
-	rows, err := d.sqlDB.Query(query, targetIDOrTitle, targetIDOrTitle)
+	rows, err := d.sqlDB.Query(query, targetIDOrTitle, targetIDOrTitle, cleanTitle, targetIDOrTitle)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query backlinks: %w", err)
 	}

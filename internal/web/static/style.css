@@ -641,6 +641,7 @@ body {
 .card-answer {
   font-size: 1.25rem;
   line-height: 1.6;
+  white-space: pre-wrap;
   color: var(--text-primary);
   background: rgba(var(--accent-rgb), 0.05);
   padding: 16px;

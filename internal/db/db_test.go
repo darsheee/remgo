@@ -268,3 +268,193 @@ func TestMarkdownExportImport(t *testing.T) {
 		t.Fatalf("imported tree structure invalid: %+v", tree2)
 	}
 }
+
+func TestMultiLineListCardHierarchy(t *testing.T) {
+	d := setupTestDB(t)
+
+	// Create list card header
+	listHeader, err := d.CreateRem(nil, "Causes of World War I ==>", nil)
+	if err != nil {
+		t.Fatalf("failed to create list header: %v", err)
+	}
+
+	// Initially no items, so no cards yet
+	cards, _ := d.GetCramCards(&listHeader.ID, 10)
+	if len(cards) != 0 {
+		t.Fatalf("expected 0 cards before children are added, got %d", len(cards))
+	}
+
+	// Add child bullets
+	c1, _ := d.CreateRem(&listHeader.ID, "Militarism", nil)
+	c2, _ := d.CreateRem(&listHeader.ID, "Alliances", nil)
+	c3, _ := d.CreateRem(&listHeader.ID, "Imperialism", nil)
+	c4, _ := d.CreateRem(&listHeader.ID, "Nationalism", nil)
+	_ = c1
+	_ = c2
+	_ = c3
+
+	// Now 1 list card should exist with all 4 items in the Back
+	cards, err = d.GetCramCards(&listHeader.ID, 10)
+	if err != nil {
+		t.Fatalf("GetCramCards failed: %v", err)
+	}
+	if len(cards) != 1 {
+		t.Fatalf("expected 1 list card generated from children, got %d", len(cards))
+	}
+	if cards[0].Front != "Causes of World War I ==>" {
+		t.Errorf("unexpected front: %s", cards[0].Front)
+	}
+	expectedBack := "1. Militarism\n2. Alliances\n3. Imperialism\n4. Nationalism"
+	if cards[0].Back != expectedBack {
+		t.Errorf("expected back:\n%s\ngot:\n%s", expectedBack, cards[0].Back)
+	}
+
+	// Delete one child bullet (Nationalism)
+	err = d.DeleteRem(c4.ID)
+	if err != nil {
+		t.Fatalf("failed to delete child: %v", err)
+	}
+
+	// List card should automatically update to have 3 items
+	cards, _ = d.GetCramCards(&listHeader.ID, 10)
+	if len(cards) != 1 {
+		t.Fatalf("expected 1 list card after child deletion, got %d", len(cards))
+	}
+	expectedBack3 := "1. Militarism\n2. Alliances\n3. Imperialism"
+	if cards[0].Back != expectedBack3 {
+		t.Errorf("expected updated back:\n%s\ngot:\n%s", expectedBack3, cards[0].Back)
+	}
+}
+
+func TestCardPreservationOnFrontEdit(t *testing.T) {
+	d := setupTestDB(t)
+
+	// Create a card with typo in front
+	rem, err := d.CreateRem(nil, "Goolang :: Fast language", nil)
+	if err != nil {
+		t.Fatalf("failed to create rem: %v", err)
+	}
+
+	due, _ := d.GetDueCards(10)
+	if len(due) != 1 {
+		t.Fatalf("expected 1 card, got %d", len(due))
+	}
+	originalCardID := due[0].ID
+
+	// Review the card with Good
+	res, err := d.ReviewCard(originalCardID, srs.RatingGood, false)
+	if err != nil {
+		t.Fatalf("ReviewCard failed: %v", err)
+	}
+	if res.Card.Reps != 1 || res.Card.State != srs.StateReview {
+		t.Fatalf("unexpected state after review: reps=%d, state=%s", res.Card.Reps, res.Card.State)
+	}
+
+	// Fix the typo in the Rem front
+	fixedContent := "Golang :: Fast language"
+	_, err = d.UpdateRem(rem.ID, &fixedContent, nil)
+	if err != nil {
+		t.Fatalf("UpdateRem failed: %v", err)
+	}
+
+	// Check that the card ID, Reps, and SRS State were preserved!
+	allCards, _ := d.GetCramCards(&rem.ID, 10)
+	if len(allCards) != 1 {
+		t.Fatalf("expected 1 card after edit, got %d", len(allCards))
+	}
+	c := allCards[0]
+	if c.ID != originalCardID {
+		t.Errorf("expected card ID to be preserved! original=%s, now=%s", originalCardID, c.ID)
+	}
+	if c.Front != "Golang" {
+		t.Errorf("expected front to be updated to 'Golang', got '%s'", c.Front)
+	}
+	if c.Reps != 1 {
+		t.Errorf("expected Reps=1 to be preserved, got %d", c.Reps)
+	}
+	if c.State != srs.StateReview {
+		t.Errorf("expected State=Review to be preserved, got %s", c.State)
+	}
+}
+
+func TestCreateRemAfter(t *testing.T) {
+	d := setupTestDB(t)
+
+	doc, _ := d.CreateRem(nil, "Document", nil)
+	b1, _ := d.CreateRem(&doc.ID, "Bullet 1", nil)
+	b2, _ := d.CreateRem(&doc.ID, "Bullet 2", nil)
+
+	// Insert new bullet after Bullet 1
+	inserted, err := d.CreateRemAfter(b1.ID, "Bullet 1.5")
+	if err != nil {
+		t.Fatalf("CreateRemAfter failed: %v", err)
+	}
+
+	tree, _ := d.GetTree(&doc.ID)
+	if len(tree) != 1 || len(tree[0].Children) != 3 {
+		t.Fatalf("expected 3 children under doc, got %+v", tree)
+	}
+
+	c := tree[0].Children
+	if c[0].ID != b1.ID || c[1].ID != inserted.ID || c[2].ID != b2.ID {
+		t.Errorf("bullets in wrong order: [0]=%s, [1]=%s, [2]=%s", c[0].Content, c[1].Content, c[2].Content)
+	}
+}
+
+func TestLateReferenceResolution(t *testing.T) {
+	d := setupTestDB(t)
+
+	// Create Note 1 that references [[Artificial Intelligence]] before AI note exists
+	note1, err := d.CreateRem(nil, "Machine Learning is a subset of [[Artificial Intelligence]]", nil)
+	if err != nil {
+		t.Fatalf("failed to create note1: %v", err)
+	}
+	_ = note1
+
+	// Now create the Artificial Intelligence note
+	aiNote, err := d.CreateRem(nil, "Artificial Intelligence :: Intelligence demonstrated by machines", nil)
+	if err != nil {
+		t.Fatalf("failed to create aiNote: %v", err)
+	}
+
+	// Backlinks for aiNote by ID should resolve note1!
+	backlinks, err := d.GetBacklinks(aiNote.ID)
+	if err != nil {
+		t.Fatalf("GetBacklinks failed: %v", err)
+	}
+	if len(backlinks) != 1 {
+		t.Fatalf("expected 1 backlink to aiNote, got %d", len(backlinks))
+	}
+	if backlinks[0].ID != note1.ID {
+		t.Errorf("expected backlink from note1, got %s", backlinks[0].ID)
+	}
+}
+
+func TestCascadeDeleteFTS5Clean(t *testing.T) {
+	d := setupTestDB(t)
+
+	parent, _ := d.CreateRem(nil, "Top Parent Topic", nil)
+	child, _ := d.CreateRem(&parent.ID, "Deep Child Quantum Teleportation", nil)
+	_ = child
+
+	// Search finds the child
+	res, err := d.Search("Quantum", 10)
+	if err != nil || len(res) != 1 {
+		t.Fatalf("expected 1 search result, got %d (err: %v)", len(res), err)
+	}
+
+	// Delete the parent
+	err = d.DeleteRem(parent.ID)
+	if err != nil {
+		t.Fatalf("DeleteRem failed: %v", err)
+	}
+
+	// Search for child keyword must now return 0 results (no ghost entries in FTS)
+	resAfter, err := d.Search("Quantum", 10)
+	if err != nil {
+		t.Fatalf("Search after delete failed: %v", err)
+	}
+	if len(resAfter) != 0 {
+		t.Fatalf("expected 0 search results after parent cascade delete, got %d ghost entries!", len(resAfter))
+	}
+}

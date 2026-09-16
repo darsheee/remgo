@@ -2,6 +2,7 @@ package db
 
 const SchemaSQL = `
 PRAGMA foreign_keys = ON;
+PRAGMA recursive_triggers = ON;
 
 CREATE TABLE IF NOT EXISTS rems (
     id TEXT PRIMARY KEY,

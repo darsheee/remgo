@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/darsheee/remgo/internal/db"
 	"github.com/darsheee/remgo/internal/mcp"
@@ -110,18 +109,30 @@ func (s *Server) handleListRems(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateRem(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Content  string  `json:"content"`
-		ParentID *string `json:"parent_id"`
+		Content   *string `json:"content"`
+		ParentID  *string `json:"parent_id"`
+		AfterID   *string `json:"after_id"`
+		SortOrder *int    `json:"sort_order"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if strings.TrimSpace(body.Content) == "" {
-		body.Content = "New Rem"
+
+	content := ""
+	if body.Content != nil {
+		content = *body.Content
 	}
 
-	rem, err := s.db.CreateRem(body.ParentID, body.Content, nil)
+	var rem *db.Rem
+	var err error
+
+	if body.AfterID != nil && *body.AfterID != "" {
+		rem, err = s.db.CreateRemAfter(*body.AfterID, content)
+	} else {
+		rem, err = s.db.CreateRem(body.ParentID, content, body.SortOrder)
+	}
+
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -142,7 +153,7 @@ func (s *Server) handleGetRem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ancestors, _ := s.db.GetAncestors(id)
-	backlinks, _ := s.db.GetBacklinks(rem.Content)
+	backlinks, _ := s.db.GetBacklinks(id)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"rem":       rem,

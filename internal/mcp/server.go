@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 
 	"github.com/darsheee/remgo/internal/db"
 	"github.com/darsheee/remgo/internal/srs"
@@ -95,6 +94,7 @@ var availableTools = []ToolDefinition{
 			Properties: map[string]PropertyDef{
 				"content":   {Type: "string", Description: "The text content of the Rem"},
 				"parent_id": {Type: "string", Description: "Optional parent Rem ID (leave empty for root document)"},
+				"after_id":  {Type: "string", Description: "Optional sibling Rem ID to insert immediately after"},
 			},
 			Required: []string{"content"},
 		},
@@ -199,8 +199,8 @@ func (s *Server) HandleMessage(msg []byte) ([]byte, error) {
 		})
 	}
 
-	// Notifications (no ID)
-	if req.ID == nil && strings.HasPrefix(req.Method, "notifications/") {
+	// Notifications (no ID) - in JSON-RPC 2.0, server MUST NOT reply to notifications
+	if req.ID == nil {
 		return nil, nil
 	}
 
@@ -268,11 +268,18 @@ func (s *Server) executeTool(name string, argsRaw json.RawMessage) ToolCallResul
 		var args struct {
 			Content  string  `json:"content"`
 			ParentID *string `json:"parent_id"`
+			AfterID  *string `json:"after_id"`
 		}
 		if err := json.Unmarshal(argsRaw, &args); err != nil || args.Content == "" {
 			return toolError("content is required")
 		}
-		rem, err := s.db.CreateRem(args.ParentID, args.Content, nil)
+		var rem *db.Rem
+		var err error
+		if args.AfterID != nil && *args.AfterID != "" {
+			rem, err = s.db.CreateRemAfter(*args.AfterID, args.Content)
+		} else {
+			rem, err = s.db.CreateRem(args.ParentID, args.Content, nil)
+		}
 		if err != nil {
 			return toolError(err.Error())
 		}

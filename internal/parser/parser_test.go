@@ -205,3 +205,63 @@ func TestEmptyAndBoundaryCases(t *testing.T) {
 		t.Errorf("plain note should produce no cards, got %d", len(res3.Cards))
 	}
 }
+
+func TestScopeResolutionNotCard(t *testing.T) {
+	input := "Use std::vector and my_module::helper_fn for dynamic data"
+	res := ParseContent(input)
+	if len(res.Cards) != 0 {
+		t.Errorf("mid-word scope resolution should not produce cards, got %d", len(res.Cards))
+	}
+}
+
+func TestEmptyBackListCard(t *testing.T) {
+	input := "Causes of World War I ==>"
+	res := ParseContent(input)
+	if len(res.Cards) != 1 {
+		t.Fatalf("expected 1 list card for header, got %d", len(res.Cards))
+	}
+	c := res.Cards[0]
+	if c.Type != CardTypeList {
+		t.Errorf("expected CardTypeList, got %s", c.Type)
+	}
+	if c.Front != "Causes of World War I ==>" {
+		t.Errorf("expected Front 'Causes of World War I ==>', got '%s'", c.Front)
+	}
+	if c.Back != "" {
+		t.Errorf("expected empty Back to be populated from child bullets, got '%s'", c.Back)
+	}
+}
+
+func TestDelimiterWithReferenceAndCloze(t *testing.T) {
+	input := "[[Golang]] :: A compiled language designed with {{concurrency}}"
+	res := ParseContent(input)
+
+	// Should extract 1 reference
+	if len(res.References) != 1 || res.References[0].TargetTitle != "Golang" {
+		t.Errorf("failed to extract reference: %+v", res.References)
+	}
+
+	// Should extract 2 cards: 1 forward card (with clean Front/Back) and 1 cloze card
+	if len(res.Cards) != 2 {
+		t.Fatalf("expected 2 cards, got %d", len(res.Cards))
+	}
+
+	fwdCard := res.Cards[0]
+	if fwdCard.Type != CardTypeForward {
+		t.Errorf("expected forward card, got %s", fwdCard.Type)
+	}
+	if fwdCard.Front != "Golang" {
+		t.Errorf("expected clean Front 'Golang', got '%s'", fwdCard.Front)
+	}
+	if fwdCard.Back != "A compiled language designed with concurrency" {
+		t.Errorf("expected clean Back without raw cloze braces, got '%s'", fwdCard.Back)
+	}
+
+	clozeCard := res.Cards[1]
+	if clozeCard.Type != CardTypeCloze {
+		t.Errorf("expected cloze card, got %s", clozeCard.Type)
+	}
+	if clozeCard.Back != "concurrency" {
+		t.Errorf("expected cloze answer 'concurrency', got '%s'", clozeCard.Back)
+	}
+}

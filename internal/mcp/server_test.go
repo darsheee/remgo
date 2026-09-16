@@ -130,3 +130,28 @@ func TestMCPToolExecutionWorkflow(t *testing.T) {
 		t.Fatalf("expected markdown tree to contain bullet, got: %s", treeResp.Result.Content[0].Text)
 	}
 }
+
+func TestMCPNotificationHandling(t *testing.T) {
+	srv := setupTestMCP(t)
+
+	// JSON-RPC 2.0 notification (no ID) must return nil
+	notifReq := `{"jsonrpc":"2.0","method":"notifications/initialized"}`
+	resp, err := srv.HandleMessage([]byte(notifReq))
+	if err != nil {
+		t.Fatalf("unexpected error on notification: %v", err)
+	}
+	if resp != nil {
+		t.Fatalf("expected nil response for JSON-RPC notification, got: %s", string(resp))
+	}
+
+	// Standard initialized notification without notifications/ prefix
+	notifReq2 := `{"jsonrpc":"2.0","method":"initialized"}`
+	resp2, err := srv.HandleMessage([]byte(notifReq2))
+	if err != nil {
+		t.Fatalf("unexpected error on notification: %v", err)
+	}
+	if resp2 != nil {
+		t.Fatalf("expected nil response for JSON-RPC notification without id, got: %s", string(resp2))
+	}
+}
+

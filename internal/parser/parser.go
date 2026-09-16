@@ -87,31 +87,41 @@ func ParseContent(content string) ParseResult {
 	if delim != "" {
 		front := strings.TrimSpace(trimmed[:pos])
 		back := strings.TrimSpace(trimmed[pos+len(delim):])
-		if front != "" && back != "" {
+		cleanFront := CleanDelimiters(front)
+		cleanBack := CleanDelimiters(back)
+
+		if cleanFront != "" {
 			switch delim {
 			case ":::":
-				result.Cards = append(result.Cards,
-					ParsedCard{Type: CardTypeForward, Front: front, Back: back},
-					ParsedCard{Type: CardTypeBackward, Front: back, Back: front},
-				)
+				if cleanBack != "" {
+					result.Cards = append(result.Cards,
+						ParsedCard{Type: CardTypeForward, Front: cleanFront, Back: cleanBack},
+						ParsedCard{Type: CardTypeBackward, Front: cleanBack, Back: cleanFront},
+					)
+				}
 			case "::":
-				result.Cards = append(result.Cards,
-					ParsedCard{Type: CardTypeForward, Front: front, Back: back},
-				)
+				if cleanBack != "" {
+					result.Cards = append(result.Cards,
+						ParsedCard{Type: CardTypeForward, Front: cleanFront, Back: cleanBack},
+					)
+				}
 			case ";;":
-				result.Cards = append(result.Cards,
-					ParsedCard{
-						Type:  CardTypeDescriptor,
-						Front: fmt.Sprintf("%s ;;", front),
-						Back:  back,
-					},
-				)
+				if cleanBack != "" {
+					result.Cards = append(result.Cards,
+						ParsedCard{
+							Type:  CardTypeDescriptor,
+							Front: fmt.Sprintf("%s ;;", cleanFront),
+							Back:  cleanBack,
+						},
+					)
+				}
 			case "==>":
+				// Multi-line list card: back can be provided inline or populated from child bullets
 				result.Cards = append(result.Cards,
 					ParsedCard{
 						Type:  CardTypeList,
-						Front: fmt.Sprintf("%s ==>", front),
-						Back:  back,
+						Front: fmt.Sprintf("%s ==>", cleanFront),
+						Back:  cleanBack,
 					},
 				)
 			}
@@ -314,7 +324,12 @@ func findTopLevelDelimiter(s string) (delim string, index int) {
 				return ":::", i
 			}
 			if strings.HasPrefix(s[i:], "::") {
-				return "::", i
+				// Avoid matching C++/Rust scope resolution operators like std::vector
+				if i > 0 && isIdentByte(s[i-1]) && i+2 < n && isIdentByte(s[i+2]) {
+					// Mid-word scope operator, skip
+				} else {
+					return "::", i
+				}
 			}
 			if strings.HasPrefix(s[i:], ";;") {
 				return ";;", i
@@ -326,5 +341,9 @@ func findTopLevelDelimiter(s string) (delim string, index int) {
 	}
 
 	return "", -1
+}
+
+func isIdentByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
 }
 

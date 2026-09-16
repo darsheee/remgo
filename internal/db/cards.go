@@ -44,15 +44,65 @@ func (d *DB) syncCardsAndRefsTx(tx *sql.Tx, rem *Rem) error {
 		}
 	}
 
+	// Resolve any existing unresolved references that target this Rem by title/concept
+	cleanTitle := parser.CleanDelimiters(rem.Content)
+	if parts := strings.SplitN(cleanTitle, "::", 2); len(parts) > 1 {
+		cleanTitle = strings.TrimSpace(parts[0])
+	}
+	if parts := strings.SplitN(cleanTitle, ";;", 2); len(parts) > 1 {
+		cleanTitle = strings.TrimSpace(parts[0])
+	}
+	if parts := strings.SplitN(cleanTitle, "==>", 2); len(parts) > 1 {
+		cleanTitle = strings.TrimSpace(parts[0])
+	}
+	if cleanTitle != "" {
+		_, _ = tx.Exec(
+			"UPDATE references_map SET target_rem_id = ? WHERE target_rem_id IS NULL AND LOWER(target_title) = LOWER(?)",
+			rem.ID, cleanTitle,
+		)
+	}
+
 	// 2. Sync Flashcards
+	// Populate multi-line list cards from child bullets if back is empty
+	for i := range parseResult.Cards {
+		if parseResult.Cards[i].Type == parser.CardTypeList && parseResult.Cards[i].Back == "" {
+			childRows, err := tx.Query("SELECT content FROM rems WHERE parent_id = ? ORDER BY sort_order ASC", rem.ID)
+			if err == nil {
+				var items []string
+				for childRows.Next() {
+					var cContent string
+					if err := childRows.Scan(&cContent); err == nil {
+						cleaned := parser.CleanDelimiters(cContent)
+						if cleaned != "" {
+							items = append(items, fmt.Sprintf("%d. %s", len(items)+1, cleaned))
+						}
+					}
+				}
+				childRows.Close()
+				if len(items) > 0 {
+					parseResult.Cards[i].Back = strings.Join(items, "\n")
+				}
+			}
+		}
+	}
+
+	var validCards []parser.ParsedCard
+	for _, pc := range parseResult.Cards {
+		if pc.Type == parser.CardTypeList && pc.Back == "" {
+			continue // omit list card until children or text are provided
+		}
+		validCards = append(validCards, pc)
+	}
+
 	type existingCard struct {
 		id         string
 		cardType   string
 		front      string
 		clozeIndex int
+		used       bool
 	}
 
-	existingMap := make(map[string]existingCard)
+	var existingList []existingCard
 	rows, err := tx.Query(
 		"SELECT id, card_type, front, cloze_index FROM cards WHERE rem_id = ?",
 		rem.ID,
@@ -67,25 +117,50 @@ func (d *DB) syncCardsAndRefsTx(tx *sql.Tx, rem *Rem) error {
 			rows.Close()
 			return err
 		}
-		key := fmt.Sprintf("%s:%s:%d", ec.cardType, ec.front, ec.clozeIndex)
-		existingMap[key] = ec
+		existingList = append(existingList, ec)
 	}
 	rows.Close()
 
 	matchedCardIDs := make(map[string]bool)
 
-	for _, pc := range parseResult.Cards {
-		key := fmt.Sprintf("%s:%s:%d", pc.Type, pc.Front, pc.ClozeIndex)
-		if ec, found := existingMap[key]; found {
-			// Update back & hint, preserve SRS history
+	for _, pc := range validCards {
+		var matchedID string
+
+		// 1. Try exact match (type, front, clozeIndex)
+		for i := range existingList {
+			if !existingList[i].used &&
+				existingList[i].cardType == string(pc.Type) &&
+				existingList[i].front == pc.Front &&
+				existingList[i].clozeIndex == pc.ClozeIndex {
+				matchedID = existingList[i].id
+				existingList[i].used = true
+				break
+			}
+		}
+
+		// 2. If no exact match, match by (type, clozeIndex) to preserve SRS history across front edits/typo fixes
+		if matchedID == "" {
+			for i := range existingList {
+				if !existingList[i].used &&
+					existingList[i].cardType == string(pc.Type) &&
+					existingList[i].clozeIndex == pc.ClozeIndex {
+					matchedID = existingList[i].id
+					existingList[i].used = true
+					break
+				}
+			}
+		}
+
+		if matchedID != "" {
+			// Update text while preserving SRS memory statistics
 			_, err := tx.Exec(
-				"UPDATE cards SET back = ?, hint = ? WHERE id = ?",
-				pc.Back, pc.Hint, ec.id,
+				"UPDATE cards SET front = ?, back = ?, hint = ? WHERE id = ?",
+				pc.Front, pc.Back, pc.Hint, matchedID,
 			)
 			if err != nil {
 				return fmt.Errorf("failed to update existing card: %w", err)
 			}
-			matchedCardIDs[ec.id] = true
+			matchedCardIDs[matchedID] = true
 		} else {
 			// Insert new card
 			cardID := "card_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
@@ -103,11 +178,12 @@ func (d *DB) syncCardsAndRefsTx(tx *sql.Tx, rem *Rem) error {
 			if err != nil {
 				return fmt.Errorf("failed to insert new card: %w", err)
 			}
+			matchedCardIDs[cardID] = true
 		}
 	}
 
 	// Delete obsolete cards that no longer exist in parsed content
-	for _, ec := range existingMap {
+	for _, ec := range existingList {
 		if !matchedCardIDs[ec.id] {
 			if _, err := tx.Exec("DELETE FROM cards WHERE id = ?", ec.id); err != nil {
 				return fmt.Errorf("failed to delete obsolete card: %w", err)
@@ -128,6 +204,9 @@ func (d *DB) GetDueCards(limit int) ([]*CardWithRem, error) {
 	}
 
 	now := time.Now().UTC()
+	startOfToday := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	endOfToday := startOfToday.Add(24 * time.Hour)
+
 	query := `
 	SELECT c.id, c.rem_id, r.content, c.card_type, c.front, c.back, c.cloze_index, c.hint,
 	       c.state, c.stability, c.difficulty, c.reps, c.lapses, c.last_reviewed_at, c.due_at, c.created_at
@@ -137,7 +216,7 @@ func (d *DB) GetDueCards(limit int) ([]*CardWithRem, error) {
 	ORDER BY c.state DESC, c.due_at ASC
 	LIMIT ?;`
 
-	rows, err := d.sqlDB.Query(query, now, limit)
+	rows, err := d.sqlDB.Query(query, endOfToday, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query due cards: %w", err)
 	}

@@ -149,6 +149,12 @@ func seedInitialNotesIfEmpty(d *db.DB) {
 		d.CreateRem(&doc.ID, "Two-Way Card ::: Creates two bidirectional flashcards", nil)
 		d.CreateRem(&doc.ID, "Mitochondria ;; Powerhouse of the cell (concept/descriptor card)", nil)
 		d.CreateRem(&doc.ID, "Fill in the blank: The speed of light is {{299,792,458}} m/s", nil)
+		listRem, err := d.CreateRem(&doc.ID, "Primary colors ==>", nil)
+		if err == nil {
+			d.CreateRem(&listRem.ID, "Red", nil)
+			d.CreateRem(&listRem.ID, "Green", nil)
+			d.CreateRem(&listRem.ID, "Blue", nil)
+		}
 		d.CreateRem(&doc.ID, "Link topics using [[references]] to build an interconnected knowledge graph.", nil)
 	}
 }
