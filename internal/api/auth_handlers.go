@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/darsheee/remgo/internal/auth"
@@ -13,7 +14,7 @@ import (
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	hasUsers, _ := s.db.HasUsers()
 	user := s.getUser(r)
-	authenticated := user != nil && user.ID != db.DefaultUserID
+	authenticated := user != nil && (user.ID != db.DefaultUserID || !s.authEnabled)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"auth_enabled":  s.authEnabled,
@@ -41,7 +42,12 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := s.db.CreateUser(body.Username, body.Email, body.Password, "admin")
+	email := strings.TrimSpace(body.Email)
+	if email == "" {
+		email = strings.ToLower(strings.TrimSpace(body.Username)) + "@remgo.local"
+	}
+
+	user, err := s.db.CreateUser(body.Username, email, body.Password, "admin")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -65,14 +71,10 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 
 	s.setSessionCookie(w, rawToken, 30*86400)
 
-	tokenToReturn := rawToken
-	if jwtToken != "" {
-		tokenToReturn = jwtToken
-	}
-
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"user":    user,
-		"token":   tokenToReturn,
+		"token":   rawToken,
+		"jwt":     jwtToken,
 		"message": "Admin user created successfully",
 	})
 }
@@ -89,7 +91,12 @@ func (s *Server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := s.db.CreateUser(body.Username, body.Email, body.Password, "user")
+	email := strings.TrimSpace(body.Email)
+	if email == "" {
+		email = strings.ToLower(strings.TrimSpace(body.Username)) + "@remgo.local"
+	}
+
+	user, err := s.db.CreateUser(body.Username, email, body.Password, "user")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -113,14 +120,10 @@ func (s *Server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 
 	s.setSessionCookie(w, rawToken, 30*86400)
 
-	tokenToReturn := rawToken
-	if jwtToken != "" {
-		tokenToReturn = jwtToken
-	}
-
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"user":    user,
-		"token":   tokenToReturn,
+		"token":   rawToken,
+		"jwt":     jwtToken,
 		"message": "Account created successfully",
 	})
 }
@@ -159,23 +162,37 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 
 	s.setSessionCookie(w, rawToken, 30*86400)
 
-	tokenToReturn := rawToken
-	if jwtToken != "" {
-		tokenToReturn = jwtToken
-	}
-
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"user":    user,
-		"token":   tokenToReturn,
+		"token":   rawToken,
+		"jwt":     jwtToken,
 		"message": "Login successful",
 	})
 }
 
 // handleAuthLogout terminates the active session and clears the cookie.
 func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
-	token := s.extractRawToken(r)
-	if token != "" {
-		_ = s.db.DeleteSession(token)
+	// Invalidate session from Bearer header if present
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+			bearerToken := strings.TrimSpace(parts[1])
+			if strings.Count(bearerToken, ".") == 2 {
+				// If JWT was used, invalidate all sessions for this user
+				if claims, err := auth.ValidateJWT(s.jwtSecret, bearerToken); err == nil && claims != nil {
+					_ = s.db.DeleteUserSessions(claims.UserID)
+				}
+			} else {
+				_ = s.db.DeleteSession(bearerToken)
+			}
+		}
+	}
+	// Invalidate session from Cookie if present
+	if cookie, err := r.Cookie("remgo_token"); err == nil && cookie.Value != "" {
+		_ = s.db.DeleteSession(cookie.Value)
+	}
+	if qToken := r.URL.Query().Get("token"); qToken != "" {
+		_ = s.db.DeleteSession(qToken)
 	}
 
 	s.setSessionCookie(w, "", -1)

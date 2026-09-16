@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -163,34 +164,48 @@ func main() {
 	// Handle MCP Stdio Mode
 	if cmd == "mcp" {
 		var mcpUserID string
+		rawCred := strings.TrimSpace(*apiKeyFlag)
+		if rawCred == "" {
+			rawCred = strings.TrimSpace(*tokenFlag)
+		}
 
-		if *apiKeyFlag != "" {
-			user, _, err := database.ValidateAPIKey(*apiKeyFlag)
+		jwtSecret := []byte(os.Getenv("REMGO_JWT_SECRET"))
+
+		if rawCred != "" {
+			user, err := database.AuthenticateToken(rawCred, jwtSecret)
 			if err != nil || user == nil {
-				log.Fatalf("MCP authentication failed: invalid API key")
-			}
-			mcpUserID = user.ID
-		} else if *tokenFlag != "" {
-			user, _, err := database.ValidateSession(*tokenFlag)
-			if err != nil || user == nil {
-				log.Fatalf("MCP authentication failed: invalid token")
-			}
-			mcpUserID = user.ID
-		} else if *userFlag != "" {
-			user, err := database.GetUserByUsernameOrEmail(*userFlag)
-			if err != nil || user == nil {
-				user, err = database.GetUserByID(*userFlag)
-			}
-			if err != nil || user == nil {
-				log.Fatalf("MCP user '%s' not found", *userFlag)
+				log.Fatalf("MCP authentication failed: invalid API key or token")
 			}
 			mcpUserID = user.ID
 		} else if authEnabled {
+			if *userFlag != "" {
+				fmt.Fprintln(os.Stderr, "Error: Authentication is enabled for this RemGo database.")
+				fmt.Fprintln(os.Stderr, "The --user flag cannot bypass authentication. Please provide --api-key or --token.")
+				os.Exit(1)
+			}
 			fmt.Fprintln(os.Stderr, "Error: Authentication is enabled for this RemGo database.")
 			fmt.Fprintln(os.Stderr, "Please provide an API key via --api-key flag or REMGO_API_KEY environment variable.")
 			os.Exit(1)
 		} else {
-			mcpUserID = db.DefaultUserID
+			// Single-user / local mode
+			if *userFlag != "" {
+				user, err := database.GetUserByUsernameOrEmail(*userFlag)
+				if err != nil || user == nil {
+					user, err = database.GetUserByID(*userFlag)
+				}
+				if err != nil || user == nil {
+					log.Fatalf("MCP user '%s' not found", *userFlag)
+				}
+				mcpUserID = user.ID
+			} else {
+				// If exactly 1 human user exists, default to that user
+				users, err := database.ListUsers()
+				if err == nil && len(users) == 1 {
+					mcpUserID = users[0].ID
+				} else {
+					mcpUserID = db.DefaultUserID
+				}
+			}
 		}
 
 		mcpServer := mcp.NewServer(database)
@@ -201,8 +216,28 @@ func main() {
 	}
 
 	// Default: Start HTTP Outliner & SRS Web Server
+	defaultUserID := db.DefaultUserID
+	if *userFlag != "" {
+		u, err := database.GetUserByUsernameOrEmail(*userFlag)
+		if err != nil || u == nil {
+			u, err = database.GetUserByID(*userFlag)
+		}
+		if u != nil {
+			defaultUserID = u.ID
+		} else if !authEnabled {
+			log.Fatalf("Specified user '%s' not found", *userFlag)
+		}
+	} else if !authEnabled {
+		// In single-user mode, if exactly 1 human user exists, seamlessly use their ID
+		users, err := database.ListUsers()
+		if err == nil && len(users) == 1 {
+			defaultUserID = users[0].ID
+		}
+	}
+
 	staticHandler := web.Handler()
 	apiServer := api.NewServer(database, staticHandler, authEnabled)
+	apiServer.SetDefaultUserID(defaultUserID)
 
 	addr := fmt.Sprintf("%s:%d", *hostFlag, *portFlag)
 	httpServer := &http.Server{
@@ -259,23 +294,24 @@ func main() {
 }
 
 func seedInitialNotesIfEmpty(d *db.DB) {
-	tree, err := d.GetTree(db.DefaultUserID, nil)
-	if err == nil && len(tree) == 0 {
-		doc, err := d.CreateRem(db.DefaultUserID, nil, "Getting Started with RemGo", nil)
-		if err != nil {
-			return
-		}
-		d.CreateRem(db.DefaultUserID, &doc.ID, "RemGo is a local-first, zero-latency outliner with FSRS spaced repetition.", nil)
-		d.CreateRem(db.DefaultUserID, &doc.ID, "Forward Card :: Front asks question, Back contains answer", nil)
-		d.CreateRem(db.DefaultUserID, &doc.ID, "Two-Way Card ::: Creates two bidirectional flashcards", nil)
-		d.CreateRem(db.DefaultUserID, &doc.ID, "Mitochondria ;; Powerhouse of the cell (concept/descriptor card)", nil)
-		d.CreateRem(db.DefaultUserID, &doc.ID, "Fill in the blank: The speed of light is {{299,792,458}} m/s", nil)
-		listRem, err := d.CreateRem(db.DefaultUserID, &doc.ID, "Primary colors ==>", nil)
-		if err == nil {
-			d.CreateRem(db.DefaultUserID, &listRem.ID, "Red", nil)
-			d.CreateRem(db.DefaultUserID, &listRem.ID, "Green", nil)
-			d.CreateRem(db.DefaultUserID, &listRem.ID, "Blue", nil)
-		}
-		d.CreateRem(db.DefaultUserID, &doc.ID, "Link topics using [[references]] to build an interconnected knowledge graph.", nil)
+	hasUsers, _ := d.HasUsers()
+	if hasUsers || !d.IsEmpty() {
+		return
 	}
+	doc, err := d.CreateRem(db.DefaultUserID, nil, "Getting Started with RemGo", nil)
+	if err != nil {
+		return
+	}
+	d.CreateRem(db.DefaultUserID, &doc.ID, "RemGo is a local-first, zero-latency outliner with FSRS spaced repetition.", nil)
+	d.CreateRem(db.DefaultUserID, &doc.ID, "Forward Card :: Front asks question, Back contains answer", nil)
+	d.CreateRem(db.DefaultUserID, &doc.ID, "Two-Way Card ::: Creates two bidirectional flashcards", nil)
+	d.CreateRem(db.DefaultUserID, &doc.ID, "Mitochondria ;; Powerhouse of the cell (concept/descriptor card)", nil)
+	d.CreateRem(db.DefaultUserID, &doc.ID, "Fill in the blank: The speed of light is {{299,792,458}} m/s", nil)
+	listRem, err := d.CreateRem(db.DefaultUserID, &doc.ID, "Primary colors ==>", nil)
+	if err == nil {
+		d.CreateRem(db.DefaultUserID, &listRem.ID, "Red", nil)
+		d.CreateRem(db.DefaultUserID, &listRem.ID, "Green", nil)
+		d.CreateRem(db.DefaultUserID, &listRem.ID, "Blue", nil)
+	}
+	d.CreateRem(db.DefaultUserID, &doc.ID, "Link topics using [[references]] to build an interconnected knowledge graph.", nil)
 }

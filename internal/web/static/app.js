@@ -106,6 +106,8 @@ class RemGoApp {
         this.currentUser = status.user || { username: 'default', role: 'local' };
       } else {
         this.currentUser = null;
+        this.token = '';
+        localStorage.removeItem('remgo_token');
       }
 
       this.updateUserProfileUI();
@@ -248,7 +250,7 @@ class RemGoApp {
         body: JSON.stringify(body)
       });
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({ error: res.statusText || 'Authentication failed' }));
       if (!res.ok) {
         alertBox.innerText = data.error || 'Authentication failed';
         alertBox.classList.remove('hidden');
@@ -292,6 +294,13 @@ class RemGoApp {
     this.updateUserProfileUI();
     this.renderDocsList();
     this.renderOutlinerTree([]);
+
+    const dueBadge = document.getElementById('dueBadge');
+    if (dueBadge) dueBadge.innerText = '0';
+    const breadcrumbs = document.getElementById('breadcrumbsBar');
+    if (breadcrumbs) breadcrumbs.innerHTML = '<span class="breadcrumb-item" onclick="app.zoomTo(null)">Home</span>';
+    const docTitle = document.getElementById('docTitleInput');
+    if (docTitle) docTitle.value = '';
 
     if (this.authEnabled) {
       this.openAuthModal('login');

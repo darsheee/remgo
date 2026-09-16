@@ -68,6 +68,9 @@ func (d *DB) CreateUser(username, email, password, role string) (*User, error) {
 	if len(username) < 3 || len(username) > 50 {
 		return nil, fmt.Errorf("%w: username must be between 3 and 50 characters", ErrInvalidInput)
 	}
+	if email == "" {
+		email = strings.ToLower(username) + "@remgo.local"
+	}
 	if len(email) < 3 || !strings.Contains(email, "@") {
 		return nil, fmt.Errorf("%w: invalid email address", ErrInvalidInput)
 	}
@@ -236,6 +239,9 @@ func (d *DB) ListUsers() ([]*User, error) {
 
 // DeleteUser removes a user and cascades all their notes, cards, and keys.
 func (d *DB) DeleteUser(id string) error {
+	if id == DefaultUserID {
+		return errors.New("cannot delete default user")
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -469,4 +475,47 @@ func (d *DB) DeleteAPIKey(userID, keyID string) error {
 
 	_, err := d.sqlDB.Exec("DELETE FROM api_keys WHERE id = ? AND user_id = ?", keyID, userID)
 	return err
+}
+
+// AuthenticateToken verifies a credential token which can be a Personal Access Token (remgo_pat_...),
+// a Session token, or an HS256 JWT (if jwtSecret is provided).
+func (d *DB) AuthenticateToken(token string, jwtSecret ...[]byte) (*User, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, auth.ErrInvalidToken
+	}
+
+	// 1. Personal Access Token (remgo_pat_...)
+	if strings.HasPrefix(token, "remgo_pat_") {
+		user, _, err := d.ValidateAPIKey(token)
+		if err == nil && user != nil {
+			return user, nil
+		}
+		return nil, err
+	}
+
+	// 2. HS256 JWT (3 parts separated by dots)
+	if strings.Count(token, ".") == 2 && len(jwtSecret) > 0 && len(jwtSecret[0]) > 0 {
+		claims, err := auth.ValidateJWT(jwtSecret[0], token)
+		if err == nil && claims != nil {
+			user, err := d.GetUserByID(claims.UserID)
+			if err == nil && user != nil {
+				return user, nil
+			}
+		}
+	}
+
+	// 3. Cryptographic Session Token
+	user, _, err := d.ValidateSession(token)
+	if err == nil && user != nil {
+		return user, nil
+	}
+
+	// 4. Fallback: try ValidateAPIKey for non-prefixed API keys if any
+	user, _, err = d.ValidateAPIKey(token)
+	if err == nil && user != nil {
+		return user, nil
+	}
+
+	return nil, auth.ErrInvalidToken
 }

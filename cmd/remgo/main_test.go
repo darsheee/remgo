@@ -173,3 +173,107 @@ func TestEndToEndServerWithAuth(t *testing.T) {
 		t.Fatalf("expected 200 with Bearer token, got %d", tRes.StatusCode)
 	}
 }
+
+func TestSeedInitialNotesIdempotency(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "seed_idempotent.db")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer database.Close()
+
+	// 1. First run on empty database: notes should be seeded
+	seedInitialNotesIfEmpty(database)
+	treeDef, err := database.GetTree(db.DefaultUserID, nil)
+	if err != nil || len(treeDef) == 0 {
+		t.Fatalf("expected notes to be seeded for default user")
+	}
+
+	// 2. Admin registers: notes are adopted by admin
+	admin, err := database.CreateUser("admin", "admin@remgo.dev", "adminpass123", "admin")
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	treeAdmin, _ := database.GetTree(admin.ID, nil)
+	if len(treeAdmin) == 0 {
+		t.Fatalf("expected starter notes to be migrated to admin")
+	}
+
+	// Verify DefaultUserID has 0 notes now
+	treeDefAfter, _ := database.GetTree(db.DefaultUserID, nil)
+	if len(treeDefAfter) != 0 {
+		t.Fatalf("expected default user to have 0 notes after admin adoption, got %d", len(treeDefAfter))
+	}
+
+	// 3. Server restarts: seedInitialNotesIfEmpty is called again
+	seedInitialNotesIfEmpty(database)
+
+	// Verify DefaultUserID STILL has 0 notes (did not re-seed!)
+	treeDefAfterRestart, _ := database.GetTree(db.DefaultUserID, nil)
+	if len(treeDefAfterRestart) != 0 {
+		t.Fatalf("seedInitialNotesIfEmpty incorrectly re-seeded notes after admin setup! got %d", len(treeDefAfterRestart))
+	}
+}
+
+func TestSingleUserModeAdoptsSingleUser(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "single_user_adopt.db")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer database.Close()
+
+	// Create 1 human user with private notes
+	alice, err := database.CreateUser("alice", "alice@remgo.dev", "alicepass123", "admin")
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	_, err = database.CreateRem(alice.ID, nil, "Alice Personal Diary", nil)
+	if err != nil {
+		t.Fatalf("CreateRem failed: %v", err)
+	}
+
+	// Run server in single-user mode (auth disabled)
+	users, _ := database.ListUsers()
+	defaultUserID := db.DefaultUserID
+	if len(users) == 1 {
+		defaultUserID = users[0].ID
+	}
+
+	staticHandler := web.Handler()
+	apiServer := api.NewServer(database, staticHandler, false)
+	apiServer.SetDefaultUserID(defaultUserID)
+	ts := httptest.NewServer(apiServer.Handler())
+	defer ts.Close()
+
+	// Status endpoint should show authenticated = true and user = alice
+	sRes, err := http.Get(ts.URL + "/api/auth/status")
+	if err != nil || sRes.StatusCode != http.StatusOK {
+		t.Fatalf("failed to GET /api/auth/status: %v", err)
+	}
+	var status struct {
+		AuthEnabled   bool     `json:"auth_enabled"`
+		Authenticated bool     `json:"authenticated"`
+		User          *db.User `json:"user"`
+	}
+	json.NewDecoder(sRes.Body).Decode(&status)
+	if status.AuthEnabled {
+		t.Errorf("expected auth_enabled = false")
+	}
+	if !status.Authenticated || status.User == nil || status.User.ID != alice.ID {
+		t.Errorf("expected single user mode to adopt alice: %+v", status)
+	}
+
+	// Tree endpoint should return Alice's notes without any authentication headers
+	tRes, err := http.Get(ts.URL + "/api/tree")
+	if err != nil || tRes.StatusCode != http.StatusOK {
+		t.Fatalf("failed to GET /api/tree: %v", err)
+	}
+	var tree []*db.RemTreeNode
+	json.NewDecoder(tRes.Body).Decode(&tree)
+	if len(tree) != 1 || tree[0].Content != "Alice Personal Diary" {
+		t.Fatalf("single user mode failed to return alice's notes: %+v", tree)
+	}
+}

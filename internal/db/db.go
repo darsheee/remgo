@@ -136,6 +136,15 @@ func (d *DB) Close() error {
 	return d.sqlDB.Close()
 }
 
+// IsEmpty returns true if the database contains no rems across all users.
+func (d *DB) IsEmpty() bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	var count int
+	_ = d.sqlDB.QueryRow("SELECT COUNT(*) FROM rems").Scan(&count)
+	return count == 0
+}
+
 // migrateSchema handles upgrades from single-user legacy databases.
 func migrateSchema(s *sql.DB) error {
 	// 1. Ensure default user exists

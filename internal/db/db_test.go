@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/darsheee/remgo/internal/auth"
 	"github.com/darsheee/remgo/internal/srs"
 )
 
@@ -684,5 +685,120 @@ func TestMultiUserIsolation(t *testing.T) {
 	dueB, _ := d.GetDueCards(userB.ID, 10)
 	if len(dueB) != 1 || dueB[0].Front != "Quantum Physics" {
 		t.Errorf("Bob due cards mismatch: %+v", dueB)
+	}
+
+	// 8. Cross-tenant parent protection on CreateRem and MoveRem
+	_, err = d.CreateRem(userA.ID, &docB.ID, "Intrusion attempt", nil)
+	if err == nil {
+		t.Errorf("Alice should not be allowed to create a child under Bob's doc!")
+	}
+
+	aliceNote, err := d.CreateRem(userA.ID, nil, "Alice Standalone Note", nil)
+	if err != nil {
+		t.Fatalf("failed to create alice note: %v", err)
+	}
+	err = d.MoveRem(userA.ID, aliceNote.ID, &docB.ID, 0)
+	if err == nil {
+		t.Errorf("Alice should not be allowed to move her note under Bob's doc!")
+	}
+}
+
+func TestAuthenticateTokenUnified(t *testing.T) {
+	d := setupTestDB(t)
+
+	user, err := d.CreateUser("authuser", "authuser@remgo.dev", "password123", "")
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	// 1. Validate via Personal Access Token
+	pat, _, err := d.CreateAPIKey(user.ID, "Test PAT", nil)
+	if err != nil {
+		t.Fatalf("CreateAPIKey failed: %v", err)
+	}
+	uPAT, err := d.AuthenticateToken(pat)
+	if err != nil || uPAT.ID != user.ID {
+		t.Fatalf("AuthenticateToken with PAT failed: %v", err)
+	}
+
+	// 2. Validate via Session Token
+	sessToken, _, err := d.CreateSession(user.ID, "agent", "127.0.0.1", time.Hour)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	uSess, err := d.AuthenticateToken(sessToken)
+	if err != nil || uSess.ID != user.ID {
+		t.Fatalf("AuthenticateToken with Session failed: %v", err)
+	}
+
+	// 3. Validate via HS256 JWT
+	jwtSecret := []byte("super-secret-jwt-key-for-test-32b")
+	jwt, err := auth.CreateJWT(jwtSecret, auth.JWTClaims{
+		UserID:    user.ID,
+		Username:  user.Username,
+		Email:     user.Email,
+		Role:      user.Role,
+		IssuedAt:  time.Now().Unix(),
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatalf("CreateJWT failed: %v", err)
+	}
+	uJWT, err := d.AuthenticateToken(jwt, jwtSecret)
+	if err != nil || uJWT.ID != user.ID {
+		t.Fatalf("AuthenticateToken with JWT failed: %v", err)
+	}
+
+	// 4. Invalid token returns error
+	_, err = d.AuthenticateToken("invalid_garbage_token")
+	if err == nil {
+		t.Errorf("expected error for invalid token")
+	}
+
+	// 5. Expired session returns error
+	expSessToken, _, err := d.CreateSession(user.ID, "agent", "127.0.0.1", -time.Hour)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	_, err = d.AuthenticateToken(expSessToken)
+	if err == nil {
+		t.Errorf("expected error for expired session token")
+	}
+}
+
+func TestDBIsEmptyAndDeleteUser(t *testing.T) {
+	d := setupTestDB(t)
+
+	// In clean DB without rems, IsEmpty should be true
+	if !d.IsEmpty() {
+		t.Errorf("expected IsEmpty to be true on clean DB")
+	}
+
+	// Create note -> IsEmpty should be false
+	rem, err := d.CreateRem(DefaultUserID, nil, "Sample Note", nil)
+	if err != nil {
+		t.Fatalf("CreateRem failed: %v", err)
+	}
+	if d.IsEmpty() {
+		t.Errorf("expected IsEmpty to be false after creating note")
+	}
+
+	// Clean up rem
+	_ = d.DeleteRem(DefaultUserID, rem.ID)
+	if !d.IsEmpty() {
+		t.Errorf("expected IsEmpty to be true after deleting note")
+	}
+
+	// Cannot delete DefaultUserID
+	err = d.DeleteUser(DefaultUserID)
+	if err == nil {
+		t.Errorf("expected error when deleting DefaultUserID")
+	}
+
+	// Can delete custom user
+	customUser, _ := d.CreateUser("deleteme", "del@remgo.dev", "delpass123", "")
+	err = d.DeleteUser(customUser.ID)
+	if err != nil {
+		t.Errorf("failed to delete custom user: %v", err)
 	}
 }

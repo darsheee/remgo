@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/darsheee/remgo/internal/auth"
 	"github.com/darsheee/remgo/internal/db"
 	"github.com/darsheee/remgo/internal/mcp"
 	"github.com/darsheee/remgo/internal/srs"
@@ -18,11 +17,12 @@ import (
 
 // Server handles all REST API, MCP HTTP, and authentication endpoints.
 type Server struct {
-	db          *db.DB
-	mcpServer   *mcp.Server
-	mux         *http.ServeMux
-	authEnabled bool
-	jwtSecret   []byte
+	db            *db.DB
+	mcpServer     *mcp.Server
+	mux           *http.ServeMux
+	authEnabled   bool
+	defaultUserID string
+	jwtSecret     []byte
 }
 
 // NewServer initializes the HTTP API server.
@@ -39,15 +39,28 @@ func NewServer(database *db.DB, staticHandler http.Handler, authEnabled ...bool)
 	}
 
 	s := &Server{
-		db:          database,
-		mcpServer:   mcp.NewServer(database),
-		mux:         http.NewServeMux(),
-		authEnabled: enabled,
-		jwtSecret:   secret,
+		db:            database,
+		mcpServer:     mcp.NewServer(database),
+		mux:           http.NewServeMux(),
+		authEnabled:   enabled,
+		defaultUserID: db.DefaultUserID,
+		jwtSecret:     secret,
 	}
 
 	s.registerRoutes(staticHandler)
 	return s
+}
+
+// SetDefaultUserID configures the user ID to use for single-user (unauthenticated) requests.
+func (s *Server) SetDefaultUserID(userID string) {
+	if userID != "" {
+		s.defaultUserID = userID
+	}
+}
+
+// GetJWTSecret returns the active JWT secret.
+func (s *Server) GetJWTSecret() []byte {
+	return s.jwtSecret
 }
 
 // IsAuthEnabled returns true if authentication is required.
@@ -184,38 +197,24 @@ func (s *Server) extractRawToken(r *http.Request) string {
 func (s *Server) getUser(r *http.Request) *db.User {
 	token := s.extractRawToken(r)
 	if token != "" {
-		// Try Personal Access Token (remgo_pat_...)
-		if strings.HasPrefix(token, "remgo_pat_") {
-			user, _, err := s.db.ValidateAPIKey(token)
-			if err == nil && user != nil {
-				return user
-			}
-		}
-
-		// Try JWT
-		if strings.Count(token, ".") == 2 {
-			claims, err := auth.ValidateJWT(s.jwtSecret, token)
-			if err == nil && claims != nil {
-				user, err := s.db.GetUserByID(claims.UserID)
-				if err == nil && user != nil {
-					return user
-				}
-			}
-		}
-
-		// Try Session token
-		user, _, err := s.db.ValidateSession(token)
+		user, err := s.db.AuthenticateToken(token, s.jwtSecret)
 		if err == nil && user != nil {
 			return user
 		}
 	}
 
-	// If auth is not enabled, default to single-user default account
+	// If auth is not enabled, default to configured default account
 	if !s.authEnabled {
+		if s.defaultUserID != "" && s.defaultUserID != db.DefaultUserID {
+			user, err := s.db.GetUserByID(s.defaultUserID)
+			if err == nil && user != nil {
+				return user
+			}
+		}
 		return &db.User{
-			ID:        db.DefaultUserID,
-			Username:  db.DefaultUsername,
-			Role:      "admin",
+			ID:       db.DefaultUserID,
+			Username: db.DefaultUsername,
+			Role:     "admin",
 		}
 	}
 

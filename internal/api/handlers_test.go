@@ -376,4 +376,123 @@ func TestAuthWorkflowAndEnforcement(t *testing.T) {
 	if strings.Contains(wAdminTree.Body.String(), "Bob Private Secret") {
 		t.Fatalf("Admin saw Bob's private note! Data leakage!")
 	}
+
+	// 10. Registration without email (defaults to username@remgo.local)
+	noEmailBody := `{"username":"charlie", "password":"charliepass123"}`
+	noEmailReq := httptest.NewRequest("POST", "/api/auth/register", strings.NewReader(noEmailBody))
+	noEmailReq.Header.Set("Content-Type", "application/json")
+	wNoEmail := httptest.NewRecorder()
+	handler.ServeHTTP(wNoEmail, noEmailReq)
+	if wNoEmail.Code != http.StatusCreated {
+		t.Fatalf("registration without email failed with %d: %s", wNoEmail.Code, wNoEmail.Body.String())
+	}
+	var charlieResp struct {
+		User  *db.User `json:"user"`
+		Token string   `json:"token"`
+	}
+	json.Unmarshal(wNoEmail.Body.Bytes(), &charlieResp)
+	if charlieResp.User.Email != "charlie@remgo.local" {
+		t.Errorf("expected charlie@remgo.local email, got %s", charlieResp.User.Email)
+	}
+
+	// 11. Login with Username & Login with Email
+	loginUserBody := `{"username":"charlie", "password":"charliepass123"}`
+	loginUserReq := httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(loginUserBody))
+	loginUserReq.Header.Set("Content-Type", "application/json")
+	wLoginUser := httptest.NewRecorder()
+	handler.ServeHTTP(wLoginUser, loginUserReq)
+	if wLoginUser.Code != http.StatusOK {
+		t.Fatalf("login by username failed: %s", wLoginUser.Body.String())
+	}
+
+	loginEmailBody := `{"username":"charlie@remgo.local", "password":"charliepass123"}`
+	loginEmailReq := httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(loginEmailBody))
+	loginEmailReq.Header.Set("Content-Type", "application/json")
+	wLoginEmail := httptest.NewRecorder()
+	handler.ServeHTTP(wLoginEmail, loginEmailReq)
+	if wLoginEmail.Code != http.StatusOK {
+		t.Fatalf("login by email failed: %s", wLoginEmail.Body.String())
+	}
+
+	var loginEmailResp struct {
+		Token string `json:"token"`
+	}
+	json.Unmarshal(wLoginEmail.Body.Bytes(), &loginEmailResp)
+	charlieToken := loginEmailResp.Token
+
+	// Verify Charlie's session cookie was set
+	var charlieCookie *http.Cookie
+	for _, c := range wLoginEmail.Result().Cookies() {
+		if c.Name == "remgo_token" {
+			charlieCookie = c
+			break
+		}
+	}
+	if charlieCookie == nil {
+		t.Fatalf("expected charlie cookie to be set")
+	}
+
+	// Verify Charlie can access protected tree
+	charlieTreeReq := httptest.NewRequest("GET", "/api/tree", nil)
+	charlieTreeReq.Header.Set("Authorization", "Bearer "+charlieToken)
+	wCharlieTree := httptest.NewRecorder()
+	handler.ServeHTTP(wCharlieTree, charlieTreeReq)
+	if wCharlieTree.Code != http.StatusOK {
+		t.Fatalf("charlie access returned %d", wCharlieTree.Code)
+	}
+
+	// 12. Logout revokes active session and cookie
+	logoutReq := httptest.NewRequest("POST", "/api/auth/logout", nil)
+	logoutReq.Header.Set("Authorization", "Bearer "+charlieToken)
+	logoutReq.AddCookie(charlieCookie)
+	wLogout := httptest.NewRecorder()
+	handler.ServeHTTP(wLogout, logoutReq)
+	if wLogout.Code != http.StatusOK {
+		t.Fatalf("logout failed with %d: %s", wLogout.Code, wLogout.Body.String())
+	}
+
+	// Subsequent request with the previous Bearer token MUST be rejected with 401
+	postLogoutReq := httptest.NewRequest("GET", "/api/tree", nil)
+	postLogoutReq.Header.Set("Authorization", "Bearer "+charlieToken)
+	wPostLogout := httptest.NewRecorder()
+	handler.ServeHTTP(wPostLogout, postLogoutReq)
+	if wPostLogout.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after logout with bearer token, got %d", wPostLogout.Code)
+	}
+
+	// Subsequent request with the previous cookie MUST be rejected with 401
+	postLogoutCookieReq := httptest.NewRequest("GET", "/api/tree", nil)
+	postLogoutCookieReq.AddCookie(charlieCookie)
+	wPostLogoutCookie := httptest.NewRecorder()
+	handler.ServeHTTP(wPostLogoutCookie, postLogoutCookieReq)
+	if wPostLogoutCookie.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after logout with cookie, got %d", wPostLogoutCookie.Code)
+	}
+
+	// 13. Cross-tenant parent ID isolation: Charlie cannot attach note to Bob's note
+	var bobRem db.Rem
+	json.Unmarshal(wBobCreate.Body.Bytes(), &bobRem)
+
+	crossParentReq := httptest.NewRequest("POST", "/api/rems", strings.NewReader(`{"content":"Charlie Intruder", "parent_id":"`+bobRem.ID+`"}`))
+	crossParentReq.Header.Set("Authorization", "Bearer "+bobToken) // authenticate as bob to get bob's token or charlie
+	// Now Charlie attempts to use bobRem.ID
+	crossCharlieReq := httptest.NewRequest("POST", "/api/rems", strings.NewReader(`{"content":"Charlie Intruder", "parent_id":"`+bobRem.ID+`"}`))
+	// Charlie needs a fresh token
+	freshLoginReq := httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(loginUserBody))
+	freshLoginReq.Header.Set("Content-Type", "application/json")
+	wFreshLogin := httptest.NewRecorder()
+	handler.ServeHTTP(wFreshLogin, freshLoginReq)
+	var freshLoginResp struct {
+		Token string `json:"token"`
+	}
+	json.Unmarshal(wFreshLogin.Body.Bytes(), &freshLoginResp)
+	freshToken := freshLoginResp.Token
+
+	crossCharlieReq.Header.Set("Authorization", "Bearer "+freshToken)
+	crossCharlieReq.Header.Set("Content-Type", "application/json")
+	wCross := httptest.NewRecorder()
+	handler.ServeHTTP(wCross, crossCharlieReq)
+	if wCross.Code != http.StatusInternalServerError && wCross.Code != http.StatusBadRequest {
+		t.Fatalf("expected error when attaching to another user's parent, got %d", wCross.Code)
+	}
 }

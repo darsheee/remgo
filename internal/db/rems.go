@@ -26,6 +26,16 @@ func (d *DB) CreateRem(userID string, parentID *string, content string, sortOrde
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
+	if parentID != nil && *parentID == "" {
+		parentID = nil
+	}
+	if parentID != nil {
+		var parentExists int
+		err := tx.QueryRow("SELECT 1 FROM rems WHERE id = ? AND user_id = ?", *parentID, userID).Scan(&parentExists)
+		if err != nil {
+			return nil, fmt.Errorf("parent rem not found or access denied: %s", *parentID)
+		}
+	}
 
 	var order int
 	if sortOrder != nil {
@@ -427,8 +437,27 @@ func (d *DB) MoveRem(userID string, id string, targetParentID *string, targetSor
 	if userID == "" {
 		userID = DefaultUserID
 	}
+	if targetParentID != nil && *targetParentID == "" {
+		targetParentID = nil
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	// Check rem exists and belongs to user
+	var exists int
+	if err := d.sqlDB.QueryRow("SELECT 1 FROM rems WHERE id = ? AND user_id = ?", id, userID).Scan(&exists); err != nil {
+		return fmt.Errorf("rem not found: %s", id)
+	}
+
+	if targetParentID != nil {
+		if *targetParentID == id {
+			return fmt.Errorf("cannot move rem to be its own parent")
+		}
+		var parentExists int
+		if err := d.sqlDB.QueryRow("SELECT 1 FROM rems WHERE id = ? AND user_id = ?", *targetParentID, userID).Scan(&parentExists); err != nil {
+			return fmt.Errorf("target parent rem not found: %s", *targetParentID)
+		}
+	}
 
 	now := time.Now().UTC()
 	_, err := d.sqlDB.Exec(
