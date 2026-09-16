@@ -32,6 +32,22 @@ class RemGoApp {
     this.graphAnimId = null;
     this.dragNode = null;
 
+    // PDF Reader State
+    this.pdfDocuments = [];
+    this.currentPdfDoc = null;
+    this.currentPdf = null;
+    this.currentPdfPage = 1;
+    this.pdfScale = 1.0;
+    this.pdfHighlights = [];
+    this.activePdfSelection = null;
+    this.activeHighlightColor = '#ffeb3b';
+    this.renderedPdfPages = new Set();
+    this.renderingPdfPages = new Set();
+    this.isPdfSplitActive = false;
+    this.isPdfFullscreen = false;
+    this.lastFocusedRemID = null;
+    this.lastFocusedParentID = null;
+
     this.init();
   }
 
@@ -71,6 +87,8 @@ class RemGoApp {
   async init() {
     this.applyTheme(this.theme);
     this.bindGlobalShortcuts();
+    this.initSplitResizer();
+    this.initPdfTextSelectionListener();
 
     // Check Auth Status
     await this.checkAuthStatus();
@@ -82,6 +100,7 @@ class RemGoApp {
 
     await this.loadDocuments();
     await this.refreshDueBadge();
+    this.loadPdfLibrary();
 
     // If documents exist, load first document by default
     if (this.documents.length > 0) {
@@ -424,19 +443,30 @@ class RemGoApp {
   // View Navigation
   switchView(view) {
     this.activeView = view;
-    document.getElementById('outlinerView').style.display = view === 'outliner' ? 'block' : 'none';
+    const splitWrapper = document.getElementById('outlinerSplitWrapper');
+    if (splitWrapper) {
+      splitWrapper.style.display = (view === 'outliner') ? 'flex' : 'none';
+    }
     document.getElementById('reviewerView').style.display = view === 'reviewer' ? 'block' : 'none';
     document.getElementById('graphView').style.display = view === 'graph' ? 'block' : 'none';
+    const pdfLibView = document.getElementById('pdfLibraryView');
+    if (pdfLibView) {
+      pdfLibView.style.display = view === 'pdfs' ? 'block' : 'none';
+    }
 
     document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-    if (view === 'outliner') document.getElementById('navOutliner').classList.add('active');
+    if (view === 'outliner') document.getElementById('navOutliner')?.classList.add('active');
     if (view === 'reviewer') {
-      document.getElementById('navReview').classList.add('active');
+      document.getElementById('navReview')?.classList.add('active');
       this.startReviewSession();
     }
     if (view === 'graph') {
-      document.getElementById('navGraph').classList.add('active');
+      document.getElementById('navGraph')?.classList.add('active');
       this.initGraphView();
+    }
+    if (view === 'pdfs') {
+      document.getElementById('navPDFs')?.classList.add('active');
+      this.loadPdfLibrary();
     }
   }
 
@@ -645,6 +675,10 @@ class RemGoApp {
     const badge = this.createCardBadge(node.content);
     if (badge) inputWrapper.appendChild(badge);
 
+    // PDF Pin Badge
+    const pinBadge = this.createPdfPinBadge(node.content);
+    if (pinBadge) inputWrapper.appendChild(pinBadge);
+
     row.appendChild(toggle);
     row.appendChild(dotWrapper);
     row.appendChild(inputWrapper);
@@ -696,6 +730,11 @@ class RemGoApp {
   }
 
   bindEditorEvents(editor, node) {
+    editor.addEventListener('focus', () => {
+      this.lastFocusedRemID = editor.dataset.id;
+      this.lastFocusedParentID = node?.parent_id || this.currentDocID;
+    });
+
     let timeout = null;
     editor.addEventListener('input', () => {
       clearTimeout(timeout);
@@ -703,10 +742,12 @@ class RemGoApp {
         const text = editor.innerText.trim();
         const remID = editor.dataset.id;
 
-        const existingBadge = editor.parentElement.querySelector('.bullet-badge');
-        if (existingBadge) existingBadge.remove();
+        const existingBadges = editor.parentElement.querySelectorAll('.bullet-badge');
+        existingBadges.forEach(b => b.remove());
         const newBadge = this.createCardBadge(text);
         if (newBadge) editor.parentElement.appendChild(newBadge);
+        const pinBadge = this.createPdfPinBadge(text);
+        if (pinBadge) editor.parentElement.appendChild(pinBadge);
 
         if (remID && remID !== 'new') {
           await this.fetchAPI(`/api/rems/${remID}`, {
@@ -1174,6 +1215,11 @@ class RemGoApp {
         this.switchView('graph');
         return;
       }
+      if ((e.metaKey || e.ctrlKey) && e.key === '4') {
+        e.preventDefault();
+        this.switchView('pdfs');
+        return;
+      }
 
       // Reviewer shortcuts: Space (reveal answer), 1, 2, 3, 4 (rating)
       if (this.activeView === 'reviewer' && !this.isModalOpen()) {
@@ -1191,6 +1237,7 @@ class RemGoApp {
 
       // Modal ESC to close
       if (e.key === 'Escape') {
+        this.hidePdfSelectionTooltip();
         this.closeAllModals();
       }
     });
@@ -1377,6 +1424,1095 @@ class RemGoApp {
               .replace(/</g, '&lt;')
               .replace(/>/g, '&gt;')
               .replace(/"/g, '&quot;');
+  }
+
+  // ========================================================
+  // PDF Library & Document Management
+  // ========================================================
+
+  async loadPdfLibrary() {
+    try {
+      const res = await this.fetchAPI('/api/pdfs');
+      if (!res || !res.ok) return;
+      this.pdfDocuments = await res.json();
+      this.renderPdfDocumentsGrid();
+      this.updatePdfCountBadge();
+    } catch (e) {
+      console.error('Failed to load PDF library', e);
+    }
+  }
+
+  updatePdfCountBadge() {
+    const badge = document.getElementById('pdfCountBadge');
+    if (badge) {
+      const count = this.pdfDocuments ? this.pdfDocuments.length : 0;
+      badge.innerText = count;
+      badge.style.display = count > 0 ? 'inline-block' : 'none';
+    }
+  }
+
+  renderPdfDocumentsGrid() {
+    const grid = document.getElementById('pdfDocumentsGrid');
+    if (!grid) return;
+    grid.innerHTML = '';
+
+    if (!this.pdfDocuments || this.pdfDocuments.length === 0) {
+      grid.innerHTML = `
+        <div style="grid-column: 1 / -1; text-align: center; padding: 40px 20px; color: var(--text-muted);">
+          <p style="font-size: 1.1rem; margin-bottom: 8px;">No PDF documents uploaded yet</p>
+          <p style="font-size: 0.85rem;">Upload a PDF to start reading, highlighting quotes, and creating pinned excerpt backlinks.</p>
+        </div>
+      `;
+      return;
+    }
+
+    this.pdfDocuments.forEach(doc => {
+      const card = document.createElement('div');
+      card.className = 'pdf-card';
+      const sizeStr = (doc.file_size / (1024 * 1024)).toFixed(1) + ' MB';
+      const dateStr = new Date(doc.created_at).toLocaleDateString();
+
+      card.innerHTML = `
+        <div class="pdf-card-main">
+          <div class="pdf-card-icon">📄</div>
+          <div class="pdf-card-info">
+            <div class="pdf-card-title" title="${this.escapeHTML(doc.original_name)}">${this.escapeHTML(doc.original_name)}</div>
+            <div class="pdf-card-meta">
+              <span>${doc.page_count} pages</span>
+              <span>•</span>
+              <span>${sizeStr}</span>
+              <span>•</span>
+              <span>${dateStr}</span>
+            </div>
+          </div>
+        </div>
+        <div class="pdf-card-actions">
+          <div class="pdf-card-btns-left">
+            <button class="btn btn-sm btn-primary" onclick="app.openPdfReader('${doc.id}', 'split')">
+              <span>📖 Split</span>
+            </button>
+            <button class="btn btn-sm" onclick="app.openPdfReader('${doc.id}', 'fullscreen')">
+              <span>⛶ Full</span>
+            </button>
+          </div>
+          <button class="btn btn-sm btn-danger btn-icon" onclick="app.confirmDeletePdf('${doc.id}')" title="Delete PDF">
+            <span>🗑️</span>
+          </button>
+        </div>
+      `;
+      grid.appendChild(card);
+    });
+  }
+
+  async confirmDeletePdf(docId) {
+    if (!confirm('Are you sure you want to delete this PDF and all associated highlights?')) return;
+    try {
+      const res = await this.fetchAPI(`/api/pdfs/${docId}`, { method: 'DELETE' });
+      if (res && res.ok) {
+        if (this.currentPdfDoc && this.currentPdfDoc.id === docId) {
+          this.closePdfReader();
+          this.currentPdfDoc = null;
+          this.currentPdf = null;
+        }
+        await this.loadPdfLibrary();
+        this.showToast('PDF document deleted');
+      }
+    } catch (e) {
+      console.error('Failed to delete PDF', e);
+    }
+  }
+
+  handlePdfDragOver(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    const dropzone = document.getElementById('pdfDropzone');
+    if (dropzone) dropzone.classList.add('dragover');
+  }
+
+  handlePdfDragLeave(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    const dropzone = document.getElementById('pdfDropzone');
+    if (dropzone) dropzone.classList.remove('dragover');
+  }
+
+  handlePdfDrop(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    const dropzone = document.getElementById('pdfDropzone');
+    if (dropzone) dropzone.classList.remove('dragover');
+
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const file = e.dataTransfer.files[0];
+      if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+        this.uploadPdfFile(file);
+      } else {
+        alert('Please drop a valid PDF file.');
+      }
+    }
+  }
+
+  handlePdfFileSelected(e) {
+    if (e.target.files && e.target.files.length > 0) {
+      this.uploadPdfFile(e.target.files[0]);
+    }
+  }
+
+  async uploadPdfFile(file) {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      this.showToast('Uploading PDF...');
+      const res = await this.fetchAPI('/api/pdfs', {
+        method: 'POST',
+        body: formData
+      });
+
+      if (!res || !res.ok) {
+        let errMsg = 'Upload failed';
+        try {
+          const errData = await res.json();
+          errMsg = errData.error || errMsg;
+        } catch (e) {}
+        alert('Failed to upload PDF: ' + errMsg);
+        return;
+      }
+
+      const newDoc = await res.json();
+      await this.loadPdfLibrary();
+      this.showToast(`Uploaded ${file.name}`);
+      this.openPdfReader(newDoc.id, 'split');
+    } catch (e) {
+      console.error('Failed to upload PDF', e);
+      alert('Upload failed: ' + e.message);
+    }
+  }
+
+  // ========================================================
+  // PDF Reader & Split-View Operations
+  // ========================================================
+
+  async openPdfReader(docId, mode = 'split') {
+    this.switchView('outliner');
+    const wrapper = document.getElementById('outlinerSplitWrapper');
+    const pane = document.getElementById('pdfReaderPane');
+    const resizer = document.getElementById('splitResizer');
+
+    this.isPdfSplitActive = true;
+    if (wrapper) wrapper.classList.add('split-active');
+    if (pane) pane.classList.remove('hidden');
+    if (resizer) resizer.classList.remove('hidden');
+
+    if (mode === 'fullscreen') {
+      this.isPdfFullscreen = true;
+      if (wrapper) wrapper.classList.add('pdf-fullscreen');
+      const btn = document.getElementById('pdfFullscreenBtn');
+      if (btn) {
+        btn.innerText = '◫';
+        btn.title = 'Switch to Split View';
+      }
+    } else {
+      this.isPdfFullscreen = false;
+      if (wrapper) wrapper.classList.remove('pdf-fullscreen');
+      const btn = document.getElementById('pdfFullscreenBtn');
+      if (btn) {
+        btn.innerText = '⛶';
+        btn.title = 'Maximize PDF';
+      }
+    }
+
+    await this.loadPdfDocument(docId);
+  }
+
+  async loadPdfDocument(docId) {
+    if (!window.pdfjsLib) {
+      console.error('PDF.js library is not available');
+      return;
+    }
+
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdfjs/pdf.worker.min.js';
+
+    // 1. Fetch document metadata
+    const docRes = await this.fetchAPI(`/api/pdfs/${docId}`);
+    if (!docRes || !docRes.ok) return;
+    this.currentPdfDoc = await docRes.json();
+
+    // 2. Fetch highlights
+    const hlRes = await this.fetchAPI(`/api/pdfs/${docId}/highlights`);
+    this.pdfHighlights = (hlRes && hlRes.ok) ? await hlRes.json() : [];
+
+    // Update Toolbar UI
+    const titleEl = document.getElementById('pdfToolbarTitle');
+    if (titleEl) titleEl.innerText = this.currentPdfDoc.original_name;
+    const totalEl = document.getElementById('pdfTotalPages');
+    if (totalEl) totalEl.innerText = this.currentPdfDoc.page_count;
+    const pageInput = document.getElementById('pdfPageInput');
+    if (pageInput) {
+      pageInput.max = this.currentPdfDoc.page_count;
+      pageInput.value = 1;
+    }
+    this.currentPdfPage = 1;
+    this.updateHighlightsDrawer();
+
+    // 3. Load PDF via PDF.js
+    const contentUrl = `/api/pdfs/${docId}/content?token=${encodeURIComponent(this.token || '')}`;
+    const loadingTask = window.pdfjsLib.getDocument({
+      url: contentUrl,
+      withCredentials: true
+    });
+
+    try {
+      this.currentPdf = await loadingTask.promise;
+    } catch (err) {
+      console.error('Failed to load PDF document via PDF.js:', err);
+      return;
+    }
+
+    // 4. Setup pages stage
+    const stage = document.getElementById('pdfPagesStage');
+    if (!stage) return;
+    stage.innerHTML = '';
+    this.renderedPdfPages.clear();
+    this.renderingPdfPages.clear();
+
+    const numPages = this.currentPdf.numPages;
+    if (totalEl) totalEl.innerText = numPages;
+    if (pageInput) pageInput.max = numPages;
+
+    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+      const pageWrapper = document.createElement('div');
+      pageWrapper.className = 'pdf-page-wrapper';
+      pageWrapper.dataset.pageNumber = pageNum;
+      pageWrapper.id = `pdf-page-${pageNum}`;
+      pageWrapper.style.minHeight = '700px';
+      pageWrapper.style.width = '550px';
+
+      const pageInner = document.createElement('div');
+      pageInner.className = 'pdf-page-inner';
+
+      const canvas = document.createElement('canvas');
+      canvas.className = 'pdf-canvas';
+
+      const highlightLayer = document.createElement('div');
+      highlightLayer.className = 'pdf-highlight-layer';
+
+      const textLayer = document.createElement('div');
+      textLayer.className = 'pdf-text-layer textLayer';
+
+      pageInner.appendChild(canvas);
+      pageInner.appendChild(highlightLayer);
+      pageInner.appendChild(textLayer);
+      pageWrapper.appendChild(pageInner);
+      stage.appendChild(pageWrapper);
+    }
+
+    // Render first 2 pages immediately
+    await this.renderPdfPage(1);
+    if (numPages >= 2) {
+      await this.renderPdfPage(2);
+    }
+
+    this.onPdfViewportScroll();
+  }
+
+  async renderPdfPage(pageNum) {
+    if (!this.currentPdf || pageNum < 1 || pageNum > this.currentPdf.numPages) return;
+    if (this.renderedPdfPages.has(pageNum) || this.renderingPdfPages.has(pageNum)) return;
+
+    this.renderingPdfPages.add(pageNum);
+
+    try {
+      const page = await this.currentPdf.getPage(pageNum);
+      const viewport = page.getViewport({ scale: this.pdfScale });
+
+      const wrapper = document.getElementById(`pdf-page-${pageNum}`);
+      if (!wrapper) return;
+
+      wrapper.style.width = `${viewport.width}px`;
+      wrapper.style.minHeight = `${viewport.height}px`;
+
+      const pageInner = wrapper.querySelector('.pdf-page-inner');
+      if (pageInner) {
+        pageInner.style.width = `${viewport.width}px`;
+        pageInner.style.height = `${viewport.height}px`;
+      }
+
+      // 1. Render Canvas
+      const canvas = wrapper.querySelector('.pdf-canvas');
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = viewport.width * dpr;
+      canvas.height = viewport.height * dpr;
+      canvas.style.width = `${viewport.width}px`;
+      canvas.style.height = `${viewport.height}px`;
+
+      const ctx = canvas.getContext('2d');
+      ctx.scale(dpr, dpr);
+
+      await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+
+      // 2. Render Text Layer
+      const textLayer = wrapper.querySelector('.pdf-text-layer');
+      if (textLayer) {
+        textLayer.innerHTML = '';
+        textLayer.style.width = `${viewport.width}px`;
+        textLayer.style.height = `${viewport.height}px`;
+
+        const textContent = await page.getTextContent();
+        if (window.pdfjsLib && window.pdfjsLib.renderTextLayer) {
+          const textTask = window.pdfjsLib.renderTextLayer({
+            textContentSource: textContent,
+            container: textLayer,
+            viewport: viewport,
+            textDivs: []
+          });
+          if (textTask && textTask.promise) {
+            await textTask.promise;
+          }
+        }
+      }
+
+      // 3. Render Highlight Layer
+      this.renderHighlightsForPage(pageNum, wrapper.querySelector('.pdf-highlight-layer'));
+
+      this.renderedPdfPages.add(pageNum);
+    } catch (err) {
+      console.error(`Error rendering page ${pageNum}:`, err);
+    } finally {
+      this.renderingPdfPages.delete(pageNum);
+    }
+  }
+
+  renderHighlightsForPage(pageNum, layerEl) {
+    if (!layerEl) return;
+    layerEl.innerHTML = '';
+
+    const pageHls = this.pdfHighlights.filter(h => h.page_number === pageNum);
+    pageHls.forEach(hl => {
+      let rects = [];
+      try {
+        rects = JSON.parse(hl.rects_json);
+      } catch (e) {
+        rects = [];
+      }
+      if (!Array.isArray(rects)) rects = [rects];
+
+      rects.forEach((rect, idx) => {
+        const box = document.createElement('div');
+        box.className = 'pdf-highlight-box';
+        box.id = `hl-${hl.id}${idx > 0 ? '-' + idx : ''}`;
+        box.dataset.highlightId = hl.id;
+        box.style.left = `${(rect.x || 0) * 100}%`;
+        box.style.top = `${(rect.y || 0) * 100}%`;
+        box.style.width = `${(rect.w || 0) * 100}%`;
+        box.style.height = `${(rect.h || 0) * 100}%`;
+        box.style.backgroundColor = hl.color || '#ffeb3b';
+        box.title = hl.text_content;
+
+        box.onclick = (e) => {
+          e.stopPropagation();
+          this.flashHighlight(hl.id);
+        };
+        layerEl.appendChild(box);
+      });
+    });
+  }
+
+  onPdfViewportScroll() {
+    if (!this.currentPdf) return;
+    const viewport = document.getElementById('pdfScrollViewport');
+    if (!viewport) return;
+
+    const scrollTop = viewport.scrollTop;
+    const viewportHeight = viewport.clientHeight;
+    const numPages = this.currentPdf.numPages;
+
+    let activePage = 1;
+    for (let i = 1; i <= numPages; i++) {
+      const pageEl = document.getElementById(`pdf-page-${i}`);
+      if (!pageEl) continue;
+
+      const pageTop = pageEl.offsetTop;
+      const pageHeight = pageEl.offsetHeight;
+
+      if (pageTop <= scrollTop + viewportHeight / 3) {
+        activePage = i;
+      }
+
+      // Render if in or near viewport (600px lookahead)
+      if (pageTop + pageHeight >= scrollTop - 600 && pageTop <= scrollTop + viewportHeight + 600) {
+        if (!this.renderedPdfPages.has(i) && !this.renderingPdfPages.has(i)) {
+          this.renderPdfPage(i);
+        }
+      }
+    }
+
+    if (this.currentPdfPage !== activePage) {
+      this.currentPdfPage = activePage;
+      const pageInput = document.getElementById('pdfPageInput');
+      if (pageInput) pageInput.value = activePage;
+    }
+  }
+
+  async jumpToPdfPage(pageNum) {
+    if (!this.currentPdf || pageNum < 1 || pageNum > this.currentPdf.numPages) return;
+    this.currentPdfPage = pageNum;
+    const pageInput = document.getElementById('pdfPageInput');
+    if (pageInput) pageInput.value = pageNum;
+
+    await this.renderPdfPage(pageNum);
+
+    const pageEl = document.getElementById(`pdf-page-${pageNum}`);
+    if (pageEl) {
+      pageEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }
+
+  prevPdfPage() {
+    if (this.currentPdfPage > 1) {
+      this.jumpToPdfPage(this.currentPdfPage - 1);
+    }
+  }
+
+  nextPdfPage() {
+    if (this.currentPdf && this.currentPdfPage < this.currentPdf.numPages) {
+      this.jumpToPdfPage(this.currentPdfPage + 1);
+    }
+  }
+
+  async zoomPdf(delta) {
+    let newScale = Math.round((this.pdfScale + delta) * 100) / 100;
+    if (newScale < 0.4) newScale = 0.4;
+    if (newScale > 3.0) newScale = 3.0;
+    this.pdfScale = newScale;
+    const zoomText = document.getElementById('pdfZoomLevel');
+    if (zoomText) zoomText.innerText = Math.round(this.pdfScale * 100) + '%';
+
+    this.renderedPdfPages.clear();
+    this.renderingPdfPages.clear();
+    const stage = document.getElementById('pdfPagesStage');
+    if (stage) {
+      Array.from(stage.children).forEach(w => {
+        w.style.width = '';
+        w.style.minHeight = '';
+      });
+    }
+    this.onPdfViewportScroll();
+  }
+
+  async fitPdfWidth() {
+    if (!this.currentPdf) return;
+    const viewport = document.getElementById('pdfScrollViewport');
+    if (!viewport) return;
+    const availableWidth = viewport.clientWidth - 40;
+    try {
+      const page = await this.currentPdf.getPage(this.currentPdfPage || 1);
+      const standardViewport = page.getViewport({ scale: 1.0 });
+      this.pdfScale = Math.max(0.4, Math.min(3.0, availableWidth / standardViewport.width));
+      const zoomText = document.getElementById('pdfZoomLevel');
+      if (zoomText) zoomText.innerText = Math.round(this.pdfScale * 100) + '%';
+      this.renderedPdfPages.clear();
+      this.renderingPdfPages.clear();
+      this.onPdfViewportScroll();
+    } catch (e) {
+      console.error('Fit width error', e);
+    }
+  }
+
+  togglePdfFullscreen() {
+    const wrapper = document.getElementById('outlinerSplitWrapper');
+    this.isPdfFullscreen = !this.isPdfFullscreen;
+    const btn = document.getElementById('pdfFullscreenBtn');
+    if (this.isPdfFullscreen) {
+      if (wrapper) wrapper.classList.add('pdf-fullscreen');
+      if (btn) {
+        btn.innerText = '◫';
+        btn.title = 'Switch to Split View';
+      }
+    } else {
+      if (wrapper) wrapper.classList.remove('pdf-fullscreen');
+      if (btn) {
+        btn.innerText = '⛶';
+        btn.title = 'Maximize PDF';
+      }
+    }
+  }
+
+  closePdfReader() {
+    this.isPdfSplitActive = false;
+    this.isPdfFullscreen = false;
+    const wrapper = document.getElementById('outlinerSplitWrapper');
+    const pane = document.getElementById('pdfReaderPane');
+    const resizer = document.getElementById('splitResizer');
+
+    if (wrapper) {
+      wrapper.classList.remove('split-active');
+      wrapper.classList.remove('pdf-fullscreen');
+    }
+    if (pane) pane.classList.add('hidden');
+    if (resizer) resizer.classList.add('hidden');
+    this.hidePdfSelectionTooltip();
+  }
+
+  togglePdfSplitView() {
+    if (this.isPdfSplitActive) {
+      this.closePdfReader();
+    } else {
+      if (this.currentPdfDoc) {
+        this.openPdfReader(this.currentPdfDoc.id, 'split');
+      } else if (this.pdfDocuments && this.pdfDocuments.length > 0) {
+        this.openPdfReader(this.pdfDocuments[0].id, 'split');
+      } else {
+        this.switchView('pdfs');
+      }
+    }
+  }
+
+  togglePdfHighlightsDrawer() {
+    const drawer = document.getElementById('pdfHighlightsDrawer');
+    if (drawer) drawer.classList.toggle('hidden');
+  }
+
+  updateHighlightsDrawer() {
+    const drawer = document.getElementById('pdfHighlightsList');
+    const countSpan = document.getElementById('pdfHighlightsCount');
+    if (!drawer) return;
+    drawer.innerHTML = '';
+
+    if (countSpan) countSpan.innerText = this.pdfHighlights.length;
+
+    if (this.pdfHighlights.length === 0) {
+      drawer.innerHTML = `
+        <div style="padding: 16px 8px; text-align: center; color: var(--text-muted); font-size: 0.78rem;">
+          No highlights yet.<br>Select text in the document to highlight and quote.
+        </div>
+      `;
+      return;
+    }
+
+    this.pdfHighlights.forEach(hl => {
+      const item = document.createElement('div');
+      item.className = 'pdf-highlight-item';
+      item.innerHTML = `
+        <div class="pdf-hl-header">
+          <span class="pdf-hl-page-tag">Page ${hl.page_number}</span>
+          <button class="btn-icon-tiny" title="Delete highlight" style="font-size:0.75rem; color:var(--text-muted);">&times;</button>
+        </div>
+        <div class="pdf-hl-quote" style="border-left: 3px solid ${hl.color || '#ffeb3b'}; padding-left: 6px;">
+          ${this.escapeHTML(hl.text_content)}
+        </div>
+      `;
+
+      item.onclick = (e) => {
+        if (e.target.tagName === 'BUTTON') return;
+        this.jumpToPdfPage(hl.page_number);
+        this.flashHighlight(hl.id);
+      };
+
+      const delBtn = item.querySelector('button');
+      if (delBtn) {
+        delBtn.onclick = async (e) => {
+          e.stopPropagation();
+          await this.deletePdfHighlight(hl.id);
+        };
+      }
+
+      drawer.appendChild(item);
+    });
+  }
+
+  async deletePdfHighlight(highlightID) {
+    try {
+      const res = await this.fetchAPI(`/api/highlights/${highlightID}`, { method: 'DELETE' });
+      if (res && res.ok) {
+        this.pdfHighlights = this.pdfHighlights.filter(h => h.id !== highlightID);
+        const hlBoxes = document.querySelectorAll(`[data-highlight-id="${highlightID}"]`);
+        hlBoxes.forEach(b => b.remove());
+        this.updateHighlightsDrawer();
+        this.showToast('Highlight removed');
+      }
+    } catch (e) {
+      console.error('Failed to delete highlight', e);
+    }
+  }
+
+  // ========================================================
+  // PDF Pin Backlinks & Jumping
+  // ========================================================
+
+  parsePdfPin(content) {
+    if (!content) return null;
+    // Format 1: [[pdf:doc_id#p=1&h=hl_xxx|Label]] or [[pdf:doc_id#p=1&h=hl_xxx]]
+    const m1 = content.match(/\[\[pdf:([^#|\]]+)#p=(\d+)(?:&h=([^|\]]+))?(?:\|([^\]]+))?\]\]/);
+    if (m1) {
+      return {
+        docId: m1[1],
+        pageNum: parseInt(m1[2], 10),
+        highlightId: m1[3] || '',
+        label: m1[4] || `p.${m1[2]}`
+      };
+    }
+
+    // Format 2: [Label](pdf:doc_id#p=1&h=hl_xxx)
+    const m2 = content.match(/\[([^\]]*)\]\(pdf:([^#)]+)#p=(\d+)(?:&h=([^)]+))?\)/);
+    if (m2) {
+      return {
+        label: m2[1] || `p.${m2[3]}`,
+        docId: m2[2],
+        pageNum: parseInt(m2[3], 10),
+        highlightId: m2[4] || ''
+      };
+    }
+
+    return null;
+  }
+
+  createPdfPinBadge(content) {
+    const pin = this.parsePdfPin(content);
+    if (!pin) return null;
+
+    const span = document.createElement('span');
+    span.className = 'bullet-badge pdf-pin-badge';
+    span.innerHTML = `📌 <span>${this.escapeHTML(pin.label || ('p.' + pin.pageNum))}</span>`;
+    span.title = `Jump to PDF page ${pin.pageNum}`;
+    span.onclick = (e) => {
+      e.stopPropagation();
+      this.jumpToPdfPin(pin.docId, pin.pageNum, pin.highlightId);
+    };
+    return span;
+  }
+
+  async jumpToPdfPin(docId, pageNum, highlightId) {
+    // 1. Ensure Split View is active
+    const wrapper = document.getElementById('outlinerSplitWrapper');
+    const pane = document.getElementById('pdfReaderPane');
+    const resizer = document.getElementById('splitResizer');
+
+    this.isPdfSplitActive = true;
+    if (wrapper) {
+      wrapper.classList.add('split-active');
+      wrapper.classList.remove('pdf-fullscreen');
+    }
+    this.isPdfFullscreen = false;
+    if (pane) pane.classList.remove('hidden');
+    if (resizer) resizer.classList.remove('hidden');
+
+    // 2. Load PDF document if different
+    if (!this.currentPdfDoc || this.currentPdfDoc.id !== docId) {
+      await this.loadPdfDocument(docId);
+    }
+
+    // 3. Scroll to page
+    await this.jumpToPdfPage(pageNum);
+
+    // 4. Flash highlight
+    if (highlightId) {
+      this.flashHighlight(highlightId);
+    }
+  }
+
+  flashHighlight(highlightId) {
+    const tryFlash = () => {
+      const el = document.getElementById(`hl-${highlightId}`) ||
+                 document.querySelector(`[data-highlight-id="${highlightId}"]`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.classList.add('highlight-flash');
+        setTimeout(() => el.classList.remove('highlight-flash'), 2500);
+        return true;
+      }
+      return false;
+    };
+
+    if (!tryFlash()) {
+      setTimeout(() => {
+        if (!tryFlash()) {
+          setTimeout(tryFlash, 500);
+        }
+      }, 250);
+    }
+  }
+
+  // ========================================================
+  // PDF Text Selection & Excerpt Tooltip
+  // ========================================================
+
+  initPdfTextSelectionListener() {
+    document.addEventListener('mouseup', (e) => {
+      if (e.target.closest('#pdfSelectionTooltip')) return;
+
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || !sel.toString().trim()) {
+        this.hidePdfSelectionTooltip();
+        return;
+      }
+
+      const text = sel.toString().trim();
+      const range = sel.getRangeAt(0);
+      const pageWrapper = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+        ? range.commonAncestorContainer.closest('.pdf-page-wrapper')
+        : range.commonAncestorContainer.parentElement?.closest('.pdf-page-wrapper');
+
+      if (!pageWrapper) {
+        this.hidePdfSelectionTooltip();
+        return;
+      }
+
+      const pageNum = parseInt(pageWrapper.dataset.pageNumber, 10);
+      const pageInner = pageWrapper.querySelector('.pdf-page-inner');
+      if (!pageInner) return;
+
+      const innerRect = pageInner.getBoundingClientRect();
+      const clientRects = range.getClientRects();
+      if (clientRects.length === 0) {
+        this.hidePdfSelectionTooltip();
+        return;
+      }
+
+      const normalizedRects = [];
+      for (let i = 0; i < clientRects.length; i++) {
+        const r = clientRects[i];
+        if (r.width > 0 && r.height > 0) {
+          normalizedRects.push({
+            x: Math.max(0, (r.left - innerRect.left) / innerRect.width),
+            y: Math.max(0, (r.top - innerRect.top) / innerRect.height),
+            w: Math.min(1, r.width / innerRect.width),
+            h: Math.min(1, r.height / innerRect.height)
+          });
+        }
+      }
+
+      this.activePdfSelection = {
+        text: text,
+        pageNum: pageNum,
+        rects: normalizedRects,
+        docId: this.currentPdfDoc ? this.currentPdfDoc.id : null
+      };
+
+      const tooltip = document.getElementById('pdfSelectionTooltip');
+      if (!tooltip) return;
+
+      const lastRect = clientRects[clientRects.length - 1];
+      const topPos = lastRect.bottom + 8;
+      const leftPos = Math.max(20, Math.min(window.innerWidth - 360, lastRect.left + (lastRect.width / 2) - 130));
+
+      tooltip.style.top = `${topPos}px`;
+      tooltip.style.left = `${leftPos}px`;
+      tooltip.classList.remove('hidden');
+    });
+  }
+
+  setHighlightColor(color) {
+    this.activeHighlightColor = color;
+    document.querySelectorAll('.color-dot').forEach(d => {
+      if (d.dataset.color === color) {
+        d.classList.add('active');
+      } else {
+        d.classList.remove('active');
+      }
+    });
+  }
+
+  hidePdfSelectionTooltip() {
+    const tooltip = document.getElementById('pdfSelectionTooltip');
+    if (tooltip) tooltip.classList.add('hidden');
+    this.activePdfSelection = null;
+  }
+
+  clearPdfSelection() {
+    if (window.getSelection) {
+      window.getSelection().removeAllRanges();
+    }
+    this.hidePdfSelectionTooltip();
+  }
+
+  async createHighlightFromSelection() {
+    if (!this.activePdfSelection || !this.activePdfSelection.docId) return;
+    const { text, pageNum, rects, docId } = this.activePdfSelection;
+
+    try {
+      const res = await this.fetchAPI(`/api/pdfs/${docId}/highlights`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          page_number: pageNum,
+          rects_json: JSON.stringify(rects),
+          text_content: text,
+          color: this.activeHighlightColor || '#ffeb3b'
+        })
+      });
+
+      if (res && res.ok) {
+        const hl = await res.json();
+        this.pdfHighlights.push(hl);
+
+        const pageWrapper = document.getElementById(`pdf-page-${pageNum}`);
+        if (pageWrapper) {
+          this.renderHighlightsForPage(pageNum, pageWrapper.querySelector('.pdf-highlight-layer'));
+        }
+        this.updateHighlightsDrawer();
+        this.clearPdfSelection();
+        this.showToast('Highlight saved');
+      }
+    } catch (e) {
+      console.error('Failed to create highlight', e);
+    }
+  }
+
+  async extractExcerptToOutline() {
+    if (!this.activePdfSelection || !this.activePdfSelection.docId) return;
+    const { text, pageNum, rects, docId } = this.activePdfSelection;
+
+    try {
+      // 1. Save highlight
+      const hlRes = await this.fetchAPI(`/api/pdfs/${docId}/highlights`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          page_number: pageNum,
+          rects_json: JSON.stringify(rects),
+          text_content: text,
+          color: this.activeHighlightColor || '#ffeb3b'
+        })
+      });
+
+      if (!hlRes || !hlRes.ok) return;
+      const hl = await hlRes.json();
+      this.pdfHighlights.push(hl);
+
+      const pageWrapper = document.getElementById(`pdf-page-${pageNum}`);
+      if (pageWrapper) {
+        this.renderHighlightsForPage(pageNum, pageWrapper.querySelector('.pdf-highlight-layer'));
+      }
+      this.updateHighlightsDrawer();
+
+      // 2. Prepare pin reference & bullet content
+      const pinRef = `[[pdf:${docId}#p=${pageNum}&h=${hl.id}|p.${pageNum}]]`;
+      const remContent = `"${text}" 📌 ${pinRef}`;
+
+      // 3. Determine target document
+      let targetDocID = this.currentDocID;
+      if (!targetDocID) {
+        const title = `Notes on ${this.currentPdfDoc.original_name}`;
+        const newDocRes = await this.fetchAPI('/api/rems', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: title, parent_id: null })
+        });
+        if (newDocRes && newDocRes.ok) {
+          const newDoc = await newDocRes.json();
+          targetDocID = newDoc.id;
+          await this.loadDocuments();
+        }
+      }
+
+      // Insert rem bullet
+      const payload = {
+        content: remContent,
+        parent_id: this.lastFocusedParentID || targetDocID,
+      };
+      if (this.lastFocusedRemID) {
+        payload.after_id = this.lastFocusedRemID;
+      }
+
+      const insertRes = await this.fetchAPI('/api/rems', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (insertRes && insertRes.ok) {
+        const createdRem = await insertRes.json();
+        if (this.isPdfFullscreen) {
+          this.togglePdfFullscreen();
+        }
+        await this.loadDocument(targetDocID);
+
+        setTimeout(() => {
+          const el = document.querySelector(`[data-id="${createdRem.id}"]`);
+          if (el) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el.classList.add('bullet-pulse');
+            setTimeout(() => el.classList.remove('bullet-pulse'), 1500);
+          }
+        }, 120);
+
+        this.clearPdfSelection();
+        this.showToast('Excerpt extracted to notes!');
+      }
+    } catch (e) {
+      console.error('Failed to extract excerpt to outline', e);
+    }
+  }
+
+  async createCardFromSelection() {
+    if (!this.activePdfSelection || !this.activePdfSelection.docId) return;
+    const { text, pageNum, rects, docId } = this.activePdfSelection;
+
+    try {
+      const hlRes = await this.fetchAPI(`/api/pdfs/${docId}/highlights`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          page_number: pageNum,
+          rects_json: JSON.stringify(rects),
+          text_content: text,
+          color: this.activeHighlightColor || '#ffeb3b'
+        })
+      });
+      if (!hlRes || !hlRes.ok) return;
+      const hl = await hlRes.json();
+      this.pdfHighlights.push(hl);
+
+      const pinRef = `[[pdf:${docId}#p=${pageNum}&h=${hl.id}|p.${pageNum}]]`;
+      const remContent = `${text} :: 📌 ${pinRef}`;
+
+      let targetDocID = this.currentDocID;
+      if (!targetDocID) {
+        const title = `Notes on ${this.currentPdfDoc.original_name}`;
+        const newDocRes = await this.fetchAPI('/api/rems', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: title, parent_id: null })
+        });
+        if (newDocRes && newDocRes.ok) {
+          const newDoc = await newDocRes.json();
+          targetDocID = newDoc.id;
+          await this.loadDocuments();
+        }
+      }
+
+      const payload = {
+        content: remContent,
+        parent_id: this.lastFocusedParentID || targetDocID,
+      };
+      if (this.lastFocusedRemID) payload.after_id = this.lastFocusedRemID;
+
+      const res = await this.fetchAPI('/api/rems', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (res && res.ok) {
+        const createdRem = await res.json();
+        if (this.isPdfFullscreen) this.togglePdfFullscreen();
+        await this.loadDocument(targetDocID);
+        this.clearPdfSelection();
+        this.showToast('Flashcard created from excerpt!');
+        this.focusEditorByID(createdRem.id);
+      }
+    } catch (e) {
+      console.error('Failed to create card from excerpt', e);
+    }
+  }
+
+  async copySelectionAsBullet() {
+    if (!this.activePdfSelection || !this.activePdfSelection.docId) return;
+    const { text, pageNum, rects, docId } = this.activePdfSelection;
+
+    try {
+      const hlRes = await this.fetchAPI(`/api/pdfs/${docId}/highlights`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          page_number: pageNum,
+          rects_json: JSON.stringify(rects),
+          text_content: text,
+          color: this.activeHighlightColor || '#ffeb3b'
+        })
+      });
+      if (!hlRes || !hlRes.ok) return;
+      const hl = await hlRes.json();
+      this.pdfHighlights.push(hl);
+
+      const pinRef = `[[pdf:${docId}#p=${pageNum}&h=${hl.id}|p.${pageNum}]]`;
+      const remContent = `"${text}" 📌 ${pinRef}`;
+
+      navigator.clipboard.writeText(remContent).then(() => {
+        this.clearPdfSelection();
+        this.showToast('Copied Rem bullet to clipboard');
+      });
+    } catch (e) {
+      console.error('Failed to copy selection', e);
+    }
+  }
+
+  // ========================================================
+  // Split Resizer & Toast UI
+  // ========================================================
+
+  initSplitResizer() {
+    const resizer = document.getElementById('splitResizer');
+    const wrapper = document.getElementById('outlinerSplitWrapper');
+    const outliner = document.getElementById('outlinerView');
+    const pdfPane = document.getElementById('pdfReaderPane');
+    if (!resizer || !wrapper || !outliner || !pdfPane) return;
+
+    let isResizing = false;
+
+    resizer.addEventListener('mousedown', () => {
+      isResizing = true;
+      resizer.classList.add('resizing');
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', (e) => {
+      if (!isResizing) return;
+      const wrapperRect = wrapper.getBoundingClientRect();
+      const relativeX = e.clientX - wrapperRect.left;
+      const totalWidth = wrapperRect.width;
+
+      const leftPercent = Math.max(25, Math.min(75, (relativeX / totalWidth) * 100));
+      const rightPercent = 100 - leftPercent;
+
+      outliner.style.flex = `0 0 ${leftPercent}%`;
+      pdfPane.style.flex = `0 0 ${rightPercent}%`;
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (isResizing) {
+        isResizing = false;
+        resizer.classList.remove('resizing');
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+      }
+    });
+  }
+
+  showToast(message) {
+    let toast = document.getElementById('remgoToast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'remgoToast';
+      toast.style.cssText = `
+        position: fixed;
+        bottom: 24px;
+        right: 24px;
+        background: var(--bg-secondary);
+        color: var(--text-primary);
+        border: 1px solid var(--accent);
+        border-radius: var(--radius);
+        padding: 8px 16px;
+        font-size: 0.85rem;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+        z-index: 10000;
+        opacity: 0;
+        transform: translateY(12px);
+        transition: opacity 0.2s ease, transform 0.2s ease;
+        pointer-events: none;
+      `;
+      document.body.appendChild(toast);
+    }
+    toast.innerText = message;
+    toast.style.opacity = '1';
+    toast.style.transform = 'translateY(0)';
+    clearTimeout(this._toastTimeout);
+    this._toastTimeout = setTimeout(() => {
+      toast.style.opacity = '0';
+      toast.style.transform = 'translateY(12px)';
+    }, 2500);
   }
 }
 

@@ -6,6 +6,7 @@
   <title>RemGo — Spaced-Repetition Outliner</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/pdfjs/pdf_viewer.css">
 </head>
 <body>
   <div id="app">
@@ -48,6 +49,14 @@
             <span>Graph</span>
           </div>
           <span class="kbd-chip">⌘3</span>
+        </a>
+
+        <a class="nav-item" id="navPDFs" onclick="app.switchView('pdfs')">
+          <div class="nav-item-left">
+            <span>📄</span>
+            <span>PDFs</span>
+          </div>
+          <span class="nav-badge" id="pdfCountBadge" style="display: none;">0</span>
         </a>
       </div>
 
@@ -109,39 +118,95 @@
             <span>🔍 Search</span>
             <span class="kbd-chip">⌘K</span>
           </button>
+          <button class="btn btn-sm" id="splitPdfHeaderBtn" onclick="app.togglePdfSplitView()" title="Toggle PDF Split View">
+            <span>📖 Split PDF</span>
+          </button>
           <button class="btn btn-sm btn-primary" onclick="app.switchView('reviewer')">
             <span>⚡ Study Deck</span>
           </button>
         </div>
       </header>
 
-      <!-- View 1: Outliner -->
-      <main class="view-container" id="outlinerView">
-        <div class="outliner-header">
-          <input type="text" class="doc-title-input" id="docTitleInput" placeholder="Document Title" oninput="app.onTitleChange(this.value)">
-          <div class="doc-meta">
-            <span id="docCardsMeta">0 cards</span>
-            <span>•</span>
-            <span id="docUpdatedMeta">Updated just now</span>
+      <!-- View 1: Outliner & PDF Split Workspace -->
+      <div class="split-workspace-wrapper" id="outlinerSplitWrapper">
+        <main class="view-container" id="outlinerView">
+          <div class="outliner-header">
+            <input type="text" class="doc-title-input" id="docTitleInput" placeholder="Document Title" oninput="app.onTitleChange(this.value)">
+            <div class="doc-meta">
+              <span id="docCardsMeta">0 cards</span>
+              <span>•</span>
+              <span id="docUpdatedMeta">Updated just now</span>
+            </div>
           </div>
-        </div>
 
-        <ul class="bullet-tree" id="bulletTreeRoot">
-          <!-- Rendered recursively -->
-        </ul>
+          <ul class="bullet-tree" id="bulletTreeRoot">
+            <!-- Rendered recursively -->
+          </ul>
 
-        <!-- Linked References Section -->
-        <section class="backlinks-section" id="backlinksSection" style="display: none;">
-          <div class="backlinks-title">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
-              <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
-            </svg>
-            <span>Linked References (<span id="backlinksCount">0</span>)</span>
+          <!-- Linked References Section -->
+          <section class="backlinks-section" id="backlinksSection" style="display: none;">
+            <div class="backlinks-title">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+              </svg>
+              <span>Linked References (<span id="backlinksCount">0</span>)</span>
+            </div>
+            <div id="backlinksList"></div>
+          </section>
+        </main>
+
+        <!-- Drag Divider between Outliner and PDF Reader -->
+        <div class="split-resizer hidden" id="splitResizer"></div>
+
+        <!-- PDF Reader Pane -->
+        <section class="pdf-reader-pane hidden" id="pdfReaderPane">
+          <div class="pdf-reader-toolbar">
+            <div class="pdf-toolbar-left">
+              <button class="btn-icon-tiny" id="pdfHighlightsToggleBtn" title="Highlights Drawer" onclick="app.togglePdfHighlightsDrawer()">📑</button>
+              <span class="pdf-toolbar-title" id="pdfToolbarTitle" title="Click to view library" onclick="app.switchView('pdfs')">No document open</span>
+            </div>
+
+            <div class="pdf-toolbar-center">
+              <button class="btn-icon-tiny" onclick="app.prevPdfPage()" title="Previous Page">◀</button>
+              <div class="pdf-page-indicator">
+                <input type="number" id="pdfPageInput" min="1" value="1" onchange="app.jumpToPdfPage(parseInt(this.value, 10))">
+                <span>/</span>
+                <span id="pdfTotalPages">1</span>
+              </div>
+              <button class="btn-icon-tiny" onclick="app.nextPdfPage()" title="Next Page">▶</button>
+              <div class="pdf-toolbar-divider"></div>
+              <button class="btn-icon-tiny" onclick="app.zoomPdf(-0.15)" title="Zoom Out">−</button>
+              <span class="pdf-zoom-text" id="pdfZoomLevel">100%</span>
+              <button class="btn-icon-tiny" onclick="app.zoomPdf(0.15)" title="Zoom In">+</button>
+              <button class="btn-icon-tiny" onclick="app.fitPdfWidth()" title="Fit Width">Fit</button>
+            </div>
+
+            <div class="pdf-toolbar-right">
+              <button class="btn-icon-tiny" id="pdfFullscreenBtn" title="Toggle Fullscreen" onclick="app.togglePdfFullscreen()">⛶</button>
+              <button class="btn-icon-tiny" title="Close PDF Reader" onclick="app.closePdfReader()">✕</button>
+            </div>
           </div>
-          <div id="backlinksList"></div>
+
+          <div class="pdf-reader-content">
+            <!-- Collapsible Highlights Drawer -->
+            <aside class="pdf-highlights-drawer hidden" id="pdfHighlightsDrawer">
+              <div class="pdf-drawer-header">
+                <span>Highlights & Pins (<span id="pdfHighlightsCount">0</span>)</span>
+                <button class="btn-icon-tiny" onclick="app.togglePdfHighlightsDrawer()">✕</button>
+              </div>
+              <div class="pdf-highlights-list" id="pdfHighlightsList"></div>
+            </aside>
+
+            <!-- Scrollable Pages Viewport -->
+            <div class="pdf-scroll-viewport" id="pdfScrollViewport" onscroll="app.onPdfViewportScroll()">
+              <div class="pdf-pages-stage" id="pdfPagesStage">
+                <!-- Rendered dynamically -->
+              </div>
+            </div>
+          </div>
         </section>
-      </main>
+      </div>
 
       <!-- View 2: Flashcard Reviewer -->
       <main class="view-container" id="reviewerView" style="display: none;">
@@ -210,6 +275,34 @@
         <div class="graph-overlay">
           <button class="btn btn-sm" onclick="app.resetGraphPhysics()">Reset</button>
           <button class="btn btn-sm" onclick="app.switchView('outliner')">Close</button>
+        </div>
+      </main>
+
+      <!-- View 4: PDF Documents Library / Manager -->
+      <main class="view-container" id="pdfLibraryView" style="display: none;">
+        <div class="pdf-library-header">
+          <div class="pdf-library-title-section">
+            <h2>PDF Library & Documents</h2>
+            <p class="section-subtitle">Upload research papers, textbooks, and documents to highlight, annotate, and extract quotes into your notes.</p>
+          </div>
+          <div class="pdf-library-actions">
+            <input type="file" id="pdfFileInput" accept="application/pdf" style="display: none;" onchange="app.handlePdfFileSelected(event)">
+            <button class="btn btn-primary" onclick="document.getElementById('pdfFileInput').click()">
+              <span>📤 Upload PDF</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="pdf-dropzone" id="pdfDropzone" ondragover="app.handlePdfDragOver(event)" ondragleave="app.handlePdfDragLeave(event)" ondrop="app.handlePdfDrop(event)">
+          <div class="dropzone-content">
+            <span class="dropzone-icon">📄</span>
+            <p>Drag and drop PDF files here, or click <a href="#" onclick="document.getElementById('pdfFileInput').click(); return false;">browse</a></p>
+            <span class="dropzone-hint">Automatic page counting, text layer extraction, and visual highlight pinning</span>
+          </div>
+        </div>
+
+        <div class="pdf-documents-grid" id="pdfDocumentsGrid">
+          <!-- Rendered dynamically -->
         </div>
       </main>
     </div>
@@ -357,8 +450,36 @@
       </div>
     </div>
 
+    <!-- Floating PDF Selection Action Bar -->
+    <div class="pdf-selection-tooltip hidden" id="pdfSelectionTooltip">
+      <div class="color-palette">
+        <button class="color-dot active" data-color="#ffeb3b" style="background: #facc15;" title="Yellow" onclick="app.setHighlightColor('#ffeb3b')"></button>
+        <button class="color-dot" data-color="#86efac" style="background: #4ade80;" title="Green" onclick="app.setHighlightColor('#86efac')"></button>
+        <button class="color-dot" data-color="#f472b6" style="background: #f472b6;" title="Pink" onclick="app.setHighlightColor('#f472b6')"></button>
+        <button class="color-dot" data-color="#60a5fa" style="background: #60a5fa;" title="Blue" onclick="app.setHighlightColor('#60a5fa')"></button>
+      </div>
+      <div class="tooltip-separator"></div>
+      <button class="btn-tooltip-action" onclick="app.createHighlightFromSelection()" title="Save Highlight">
+        <span>🖍️</span>
+        <span>Highlight</span>
+      </button>
+      <button class="btn-tooltip-action" onclick="app.extractExcerptToOutline()" title="Extract to Outliner">
+        <span>📌</span>
+        <span>Extract to Outline</span>
+      </button>
+      <button class="btn-tooltip-action" onclick="app.createCardFromSelection()" title="Create Flashcard">
+        <span>⚡</span>
+        <span>Card</span>
+      </button>
+      <button class="btn-tooltip-action" onclick="app.copySelectionAsBullet()" title="Copy as Rem Bullet">
+        <span>📋</span>
+        <span>Copy</span>
+      </button>
+    </div>
+
   </div>
 
+  <script src="/pdfjs/pdf.min.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

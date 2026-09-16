@@ -187,6 +187,40 @@ var availableTools = []ToolDefinition{
 			Properties: map[string]PropertyDef{},
 		},
 	},
+	{
+		Name:        "list_pdfs",
+		Description: "List all uploaded PDF documents with their IDs, filenames, page counts, and sizes.",
+		InputSchema: InputSchema{
+			Type:       "object",
+			Properties: map[string]PropertyDef{},
+		},
+	},
+	{
+		Name:        "get_pdf_highlights",
+		Description: "Get all highlights and excerpt quotes for a specific PDF document.",
+		InputSchema: InputSchema{
+			Type: "object",
+			Properties: map[string]PropertyDef{
+				"pdf_id": {Type: "string", Description: "The PDF document ID (e.g. pdf_xxx)"},
+			},
+			Required: []string{"pdf_id"},
+		},
+	},
+	{
+		Name:        "create_pdf_highlight",
+		Description: "Create a highlight/excerpt on a specific page of a PDF document.",
+		InputSchema: InputSchema{
+			Type: "object",
+			Properties: map[string]PropertyDef{
+				"pdf_id":       {Type: "string", Description: "The PDF document ID"},
+				"page_number":  {Type: "integer", Description: "The page number (1-based)"},
+				"text_content": {Type: "string", Description: "The text content or quote extracted from the PDF"},
+				"color":        {Type: "string", Description: "Optional highlight color hex (default #ffeb3b)"},
+				"rects_json":   {Type: "string", Description: "Optional bounding rectangles JSON for visual positioning"},
+			},
+			Required: []string{"pdf_id", "page_number", "text_content"},
+		},
+	},
 }
 
 // HandleMessage parses and executes a single JSON-RPC message using the default user.
@@ -407,6 +441,46 @@ func (s *Server) executeTool(userID string, name string, argsRaw json.RawMessage
 			return toolError(err.Error())
 		}
 		return toolJSON(stats)
+
+	case "list_pdfs":
+		pdfs, err := s.db.ListPDFs(userID)
+		if err != nil {
+			return toolError(err.Error())
+		}
+		return toolJSON(pdfs)
+
+	case "get_pdf_highlights":
+		var args struct {
+			PDFID string `json:"pdf_id"`
+		}
+		if err := json.Unmarshal(argsRaw, &args); err != nil || args.PDFID == "" {
+			return toolError("pdf_id is required")
+		}
+		hls, err := s.db.ListPDFHighlights(userID, args.PDFID)
+		if err != nil {
+			return toolError(err.Error())
+		}
+		return toolJSON(hls)
+
+	case "create_pdf_highlight":
+		var args struct {
+			PDFID       string `json:"pdf_id"`
+			PageNumber  int    `json:"page_number"`
+			TextContent string `json:"text_content"`
+			Color       string `json:"color"`
+			RectsJSON   string `json:"rects_json"`
+		}
+		if err := json.Unmarshal(argsRaw, &args); err != nil || args.PDFID == "" || args.PageNumber < 1 || args.TextContent == "" {
+			return toolError("pdf_id, page_number (>= 1), and text_content are required")
+		}
+		if args.RectsJSON == "" {
+			args.RectsJSON = "[]"
+		}
+		hl, err := s.db.CreatePDFHighlight(userID, args.PDFID, args.PageNumber, args.RectsJSON, args.TextContent, args.Color)
+		if err != nil {
+			return toolError(err.Error())
+		}
+		return toolJSON(hl)
 
 	default:
 		return toolError(fmt.Sprintf("Unknown tool: %s", name))

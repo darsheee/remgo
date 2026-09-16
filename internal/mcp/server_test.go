@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -194,5 +195,59 @@ func TestMCPMultiUserIsolation(t *testing.T) {
 	aliceSearchRespRaw, _ := srv.HandleMessageForUser([]byte(aliceSearchReq), userAlice.ID)
 	if !strings.Contains(string(aliceSearchRespRaw), "Alice Secret Strategy") {
 		t.Fatalf("Alice should see her own notes: %s", string(aliceSearchRespRaw))
+	}
+}
+
+func TestMCPPDFTools(t *testing.T) {
+	srv, database := setupTestMCP(t)
+
+	user, _ := database.CreateUser("pdf_user", "pdf@remgo.dev", "pass123", "user")
+	otherUser, _ := database.CreateUser("other_user", "other@remgo.dev", "pass456", "user")
+
+	// Save test PDF for user
+	pdfBytes := []byte("%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Count 3 /Kids [ 3 0 R ] >>\nendobj\n3 0 obj\n<< /Type /Page >>\nendobj\nxref\n0 4\n0000000000 65535 f \ntrailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n300\n%%EOF\n")
+	doc, err := database.SavePDF(user.ID, "quantum_mechanics.pdf", strings.NewReader(string(pdfBytes)))
+	if err != nil {
+		t.Fatalf("failed to save PDF: %v", err)
+	}
+
+	// 1. Test list_pdfs tool
+	listReq := `{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"list_pdfs","arguments":{}}}`
+	listRespRaw, err := srv.HandleMessageForUser([]byte(listReq), user.ID)
+	if err != nil {
+		t.Fatalf("list_pdfs failed: %v", err)
+	}
+	if !strings.Contains(string(listRespRaw), "quantum_mechanics.pdf") {
+		t.Fatalf("expected PDF in list_pdfs response: %s", string(listRespRaw))
+	}
+
+	// 2. Test create_pdf_highlight tool
+	createHlReq := fmt.Sprintf(`{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"create_pdf_highlight","arguments":{"pdf_id":"%s","page_number":2,"text_content":"Wave-particle duality","color":"#ffeb3b"}}}`, doc.ID)
+	createHlRespRaw, err := srv.HandleMessageForUser([]byte(createHlReq), user.ID)
+	if err != nil {
+		t.Fatalf("create_pdf_highlight failed: %v", err)
+	}
+	if strings.Contains(string(createHlRespRaw), `"isError":true`) {
+		t.Fatalf("create_pdf_highlight returned error: %s", string(createHlRespRaw))
+	}
+	if !strings.Contains(string(createHlRespRaw), "Wave-particle duality") {
+		t.Fatalf("expected highlight text in response: %s", string(createHlRespRaw))
+	}
+
+	// 3. Test get_pdf_highlights tool
+	getHlsReq := fmt.Sprintf(`{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"get_pdf_highlights","arguments":{"pdf_id":"%s"}}}`, doc.ID)
+	getHlsRespRaw, err := srv.HandleMessageForUser([]byte(getHlsReq), user.ID)
+	if err != nil {
+		t.Fatalf("get_pdf_highlights failed: %v", err)
+	}
+	if !strings.Contains(string(getHlsRespRaw), "Wave-particle duality") {
+		t.Fatalf("expected highlight in get_pdf_highlights response: %s", string(getHlsRespRaw))
+	}
+
+	// 4. Multi-tenant isolation: other user cannot get highlights for this PDF
+	otherGetReq := fmt.Sprintf(`{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"get_pdf_highlights","arguments":{"pdf_id":"%s"}}}`, doc.ID)
+	otherGetRespRaw, _ := srv.HandleMessageForUser([]byte(otherGetReq), otherUser.ID)
+	if !strings.Contains(string(otherGetRespRaw), `"isError":true`) {
+		t.Fatalf("expected isError true for unauthorized user, got: %s", string(otherGetRespRaw))
 	}
 }

@@ -142,6 +142,17 @@ func (s *Server) registerRoutes(staticHandler http.Handler) {
 	s.mux.HandleFunc("GET /api/export", s.handleExport)
 	s.mux.HandleFunc("POST /api/import", s.handleImport)
 
+	// PDF documents & highlights
+	s.mux.HandleFunc("POST /api/pdfs", s.handleUploadPDF)
+	s.mux.HandleFunc("GET /api/pdfs", s.handleListPDFs)
+	s.mux.HandleFunc("GET /api/pdfs/{id}", s.handleGetPDF)
+	s.mux.HandleFunc("GET /api/pdfs/{id}/content", s.handleStreamPDFContent)
+	s.mux.HandleFunc("DELETE /api/pdfs/{id}", s.handleDeletePDF)
+	s.mux.HandleFunc("GET /api/pdfs/{id}/highlights", s.handleListPDFHighlights)
+	s.mux.HandleFunc("POST /api/pdfs/{id}/highlights", s.handleCreatePDFHighlight)
+	s.mux.HandleFunc("DELETE /api/highlights/{id}", s.handleDeletePDFHighlight)
+	s.mux.HandleFunc("DELETE /api/pdfs/{id}/highlights/{hl_id}", s.handleDeletePDFHighlight)
+
 	// MCP JSON-RPC over HTTP
 	s.mux.HandleFunc("POST /mcp", s.handleMCP)
 	s.mux.HandleFunc("POST /mcp/rpc", s.handleMCP)

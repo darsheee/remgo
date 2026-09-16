@@ -15,9 +15,10 @@ import (
 
 // DB wraps the SQLite database connection with thread-safety and multi-tenant business logic.
 type DB struct {
-	sqlDB *sql.DB
-	srs   *srs.FSRS
-	mu    sync.RWMutex
+	sqlDB  *sql.DB
+	srs    *srs.FSRS
+	mu     sync.RWMutex
+	pdfDir string
 }
 
 // Rem represents a bullet node in the outliner tree.
@@ -123,10 +124,32 @@ func Open(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("failed to execute indexes schema: %w", err)
 	}
 
+	pdfDir := filepath.Join(filepath.Dir(dbPath), "pdfs")
+	if err := os.MkdirAll(pdfDir, 0755); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("failed to create pdfs directory: %w", err)
+	}
+
 	return &DB{
-		sqlDB: sqlDB,
-		srs:   srs.New(),
+		sqlDB:  sqlDB,
+		srs:    srs.New(),
+		pdfDir: pdfDir,
 	}, nil
+}
+
+// PDFDir returns the directory path where PDF files are stored.
+func (d *DB) PDFDir() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.pdfDir
+}
+
+// SetPDFDir updates the directory path where PDF files are stored.
+func (d *DB) SetPDFDir(dir string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.pdfDir = dir
+	_ = os.MkdirAll(dir, 0755)
 }
 
 // Close closes the underlying SQLite database.
@@ -180,7 +203,7 @@ func migrateSchema(s *sql.DB) error {
 	}
 
 	// Migrate tables if user_id is missing
-	tables := []string{"rems", "cards", "card_reviews", "references_map"}
+	tables := []string{"rems", "cards", "card_reviews", "references_map", "pdfs", "pdf_highlights"}
 	for _, table := range tables {
 		hasCol, err := hasColumn(table, "user_id")
 		if err != nil {

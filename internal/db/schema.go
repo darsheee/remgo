@@ -88,6 +88,28 @@ CREATE TABLE IF NOT EXISTS references_map (
     created_at DATETIME NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS pdfs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL DEFAULT 'usr_default' REFERENCES users(id) ON DELETE CASCADE,
+    filename TEXT NOT NULL,
+    original_name TEXT NOT NULL,
+    file_size INTEGER NOT NULL DEFAULT 0,
+    page_count INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pdf_highlights (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL DEFAULT 'usr_default' REFERENCES users(id) ON DELETE CASCADE,
+    pdf_id TEXT NOT NULL REFERENCES pdfs(id) ON DELETE CASCADE,
+    page_number INTEGER NOT NULL,
+    rects_json TEXT NOT NULL,
+    text_content TEXT NOT NULL,
+    color TEXT NOT NULL DEFAULT '#ffeb3b',
+    created_at DATETIME NOT NULL
+);
+
 -- FTS5 Virtual Table for full-text search
 CREATE VIRTUAL TABLE IF NOT EXISTS rems_fts USING fts5(
     content,
@@ -132,4 +154,8 @@ CREATE INDEX IF NOT EXISTS idx_reviews_user_reviewed ON card_reviews(user_id, re
 CREATE INDEX IF NOT EXISTS idx_refs_source ON references_map(source_rem_id);
 CREATE INDEX IF NOT EXISTS idx_refs_user_target ON references_map(user_id, target_rem_id);
 CREATE INDEX IF NOT EXISTS idx_refs_user_title ON references_map(user_id, target_title);
+
+CREATE INDEX IF NOT EXISTS idx_pdfs_user_updated ON pdfs(user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pdf_highlights_pdf ON pdf_highlights(pdf_id, page_number);
+CREATE INDEX IF NOT EXISTS idx_pdf_highlights_user ON pdf_highlights(user_id, created_at DESC);
 `
