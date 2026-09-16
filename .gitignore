@@ -1,0 +1,40 @@
+# Binaries
+/remgo
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test and coverage artifacts
+*.test
+*.out
+coverage.html
+
+# Database & local data
+*.db
+*.db-wal
+*.db-shm
+remgo_data/
+/data/
+
+# macOS / AppleDouble artifacts
+.DS_Store
+._*
+*._*
+**/._*
+.AppleDouble
+.LSOverride
+.Trashes
+.fseventsd
+.Spotlight-V100
+
+# Editor & IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Go build cache
+vendor/

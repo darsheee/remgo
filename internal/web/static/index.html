@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RemGo — Spaced-Repetition Outliner</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <a href="#" class="brand" onclick="app.switchView('outliner'); return false;">
+          <svg viewBox="0 0 32 32" fill="none">
+            <rect width="32" height="32" rx="8" fill="#6366f1"/>
+            <circle cx="10" cy="11" r="2.5" fill="#ffffff"/>
+            <rect x="15" y="9.5" width="10" height="3" rx="1.5" fill="#ffffff"/>
+            <circle cx="10" cy="19" r="2.5" fill="#a5b4fc"/>
+            <rect x="15" y="17.5" width="8" height="3" rx="1.5" fill="#a5b4fc"/>
+          </svg>
+          <span>RemGo</span>
+        </a>
+        <span class="brand-badge">FSRS</span>
+      </div>
+
+      <div class="nav-section">
+        <a class="nav-item active" id="navOutliner" onclick="app.switchView('outliner')">
+          <div class="nav-item-left">
+            <span>📝</span>
+            <span>Notes</span>
+          </div>
+          <span class="kbd-chip">⌘1</span>
+        </a>
+
+        <a class="nav-item" id="navReview" onclick="app.switchView('reviewer')">
+          <div class="nav-item-left">
+            <span>⚡</span>
+            <span>Flashcards</span>
+          </div>
+          <span class="nav-badge" id="dueBadge">0</span>
+        </a>
+
+        <a class="nav-item" id="navGraph" onclick="app.switchView('graph')">
+          <div class="nav-item-left">
+            <span>🕸️</span>
+            <span>Graph</span>
+          </div>
+          <span class="kbd-chip">⌘3</span>
+        </a>
+      </div>
+
+      <div class="sidebar-divider"></div>
+
+      <div class="docs-section-title">
+        <span>Documents</span>
+        <button class="btn-icon-tiny" title="New Document" onclick="app.createNewDoc()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+        </button>
+      </div>
+
+      <div class="docs-list" id="docsList">
+        <!-- Rendered dynamically -->
+      </div>
+
+      <div class="sidebar-footer">
+        <button class="btn btn-sm" onclick="app.openImportExportModal()">
+          <span>⇄ Export / Import</span>
+        </button>
+        <button class="btn btn-sm btn-icon" id="themeToggleBtn" onclick="app.toggleTheme()" title="Toggle Theme">
+          <span>🌓</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Workspace -->
+    <div class="main-wrapper">
+      <!-- Top Bar -->
+      <header class="top-bar">
+        <div class="breadcrumbs" id="breadcrumbsBar">
+          <span class="breadcrumb-item" onclick="app.zoomTo(null)">Home</span>
+        </div>
+
+        <div class="top-bar-actions">
+          <button class="btn btn-sm" onclick="app.openSearchModal()">
+            <span>🔍 Search</span>
+            <span class="kbd-chip">⌘K</span>
+          </button>
+          <button class="btn btn-sm btn-primary" onclick="app.switchView('reviewer')">
+            <span>⚡ Study Deck</span>
+          </button>
+        </div>
+      </header>
+
+      <!-- View 1: Outliner -->
+      <main class="view-container" id="outlinerView">
+        <div class="outliner-header">
+          <input type="text" class="doc-title-input" id="docTitleInput" placeholder="Document Title" oninput="app.onTitleChange(this.value)">
+          <div class="doc-meta">
+            <span id="docCardsMeta">0 cards</span>
+            <span>•</span>
+            <span id="docUpdatedMeta">Updated just now</span>
+          </div>
+        </div>
+
+        <ul class="bullet-tree" id="bulletTreeRoot">
+          <!-- Rendered recursively -->
+        </ul>
+
+        <!-- Linked References Section -->
+        <section class="backlinks-section" id="backlinksSection" style="display: none;">
+          <div class="backlinks-title">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+              <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+            </svg>
+            <span>Linked References (<span id="backlinksCount">0</span>)</span>
+          </div>
+          <div id="backlinksList"></div>
+        </section>
+      </main>
+
+      <!-- View 2: Flashcard Reviewer -->
+      <main class="view-container" id="reviewerView" style="display: none;">
+        <div class="reviewer-wrapper">
+          <div class="reviewer-stats-bar">
+            <div class="counter-pills">
+              <span class="counter-pill pill-new" id="pillNew">0 New</span>
+              <span class="counter-pill pill-learn" id="pillLearn">0 Learn</span>
+              <span class="counter-pill pill-review" id="pillReview">0 Review</span>
+            </div>
+            <div style="display: flex; gap: 8px;">
+              <button class="btn btn-sm" id="cramToggleBtn" onclick="app.toggleCramMode()">
+                <span>⚡ Cram All</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="flashcard-box" id="flashcardBox">
+            <div class="card-breadcrumbs" id="cardBreadcrumbs">
+              <!-- Breadcrumbs context -->
+            </div>
+
+            <div class="card-content-area">
+              <div class="card-prompt" id="cardPrompt">
+                Press Space or click below to begin study session
+              </div>
+
+              <div id="cardAnswerWrapper" style="display: none;">
+                <div class="card-divider"></div>
+                <div class="card-answer" id="cardAnswer"></div>
+              </div>
+            </div>
+
+            <div class="reviewer-controls" id="reviewerControls">
+              <button class="btn btn-primary show-answer-btn" id="showAnswerBtn" onclick="app.revealAnswer()">
+                <span>Show Answer</span>
+                <span class="kbd-chip">Space</span>
+              </button>
+
+              <div class="rating-grid" id="ratingGrid" style="display: none;">
+                <button class="btn-rating again" onclick="app.rateCard(1)">
+                  <span class="rating-name">1 Again</span>
+                  <span class="rating-interval" id="rateAgainIntvl">< 1d</span>
+                </button>
+                <button class="btn-rating hard" onclick="app.rateCard(2)">
+                  <span class="rating-name">2 Hard</span>
+                  <span class="rating-interval" id="rateHardIntvl">1d</span>
+                </button>
+                <button class="btn-rating good" onclick="app.rateCard(3)">
+                  <span class="rating-name">3 Good</span>
+                  <span class="rating-interval" id="rateGoodIntvl">3d</span>
+                </button>
+                <button class="btn-rating easy" onclick="app.rateCard(4)">
+                  <span class="rating-name">4 Easy</span>
+                  <span class="rating-interval" id="rateEasyIntvl">7d</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <!-- View 3: Knowledge Graph -->
+      <main class="graph-container" id="graphView" style="display: none;">
+        <canvas id="graphCanvas"></canvas>
+        <div class="graph-overlay">
+          <button class="btn btn-sm" onclick="app.resetGraphPhysics()">Reset</button>
+          <button class="btn btn-sm" onclick="app.switchView('outliner')">Close</button>
+        </div>
+      </main>
+    </div>
+
+    <!-- Search Modal (Cmd+K) -->
+    <div class="modal-backdrop hidden" id="searchModal" onclick="app.handleModalBackdropClick(event, 'searchModal')">
+      <div class="modal-box">
+        <div class="search-input-wrapper">
+          <span>🔍</span>
+          <input type="text" id="searchInput" placeholder="Search notes or jumps..." oninput="app.onSearchInput(this.value)" autocomplete="off">
+          <span class="kbd-chip">ESC</span>
+        </div>
+        <div class="search-results" id="searchResultsList">
+          <!-- Results injected here -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Import / Export Modal -->
+    <div class="modal-backdrop hidden" id="importExportModal" onclick="app.handleModalBackdropClick(event, 'importExportModal')">
+      <div class="modal-box">
+        <div class="modal-header">
+          <h3>Knowledge Base Backup & Import</h3>
+          <button class="btn-icon-tiny" onclick="app.closeModal('importExportModal')">✕</button>
+        </div>
+        <div class="modal-body">
+          <p style="font-size: 0.88rem; color: var(--text-secondary); margin-bottom: 12px;">
+            Export your entire RemGo database to Markdown outline or standard JSON:
+          </p>
+          <div style="display: flex; gap: 10px; margin-bottom: 20px;">
+            <a href="/api/export" download="remgo_export.md" class="btn btn-sm">
+              <span>📥 Export Markdown (.md)</span>
+            </a>
+            <a href="/api/export?format=json" download="remgo_export.json" class="btn btn-sm">
+              <span>📥 Export JSON (.json)</span>
+            </a>
+          </div>
+
+          <p style="font-size: 0.88rem; color: var(--text-secondary); margin-bottom: 8px;">
+            Or paste a Markdown outline below to import:
+          </p>
+          <textarea class="input-area" id="importTextarea" placeholder="- Biology&#10;  - Mitochondria ;; Powerhouse of the cell&#10;  - Cell Theory :: Living units"></textarea>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-sm" onclick="app.closeModal('importExportModal')">Cancel</button>
+          <button class="btn btn-sm btn-primary" onclick="app.submitImport()">Import Markdown</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
