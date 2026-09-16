@@ -265,3 +265,49 @@ func TestDelimiterWithReferenceAndCloze(t *testing.T) {
 		t.Errorf("expected cloze answer 'concurrency', got '%s'", clozeCard.Back)
 	}
 }
+
+func TestPDFPinsParsingAndCleanDelimiters(t *testing.T) {
+	// Case 1: Bracket style with pipe label
+	text1 := "See theorem in [[pdf:doc_123#p=4&h=hl_789|p.4 Theorem]]"
+	res1 := ParseContent(text1)
+	if len(res1.References) != 0 {
+		t.Errorf("PDF pin should not be treated as a note reference: %+v", res1.References)
+	}
+	if len(res1.PDFPins) != 1 {
+		t.Fatalf("expected 1 PDF pin, got %d", len(res1.PDFPins))
+	}
+	pin1 := res1.PDFPins[0]
+	if pin1.DocID != "doc_123" || pin1.PageNumber != 4 || pin1.HighlightID != "hl_789" || pin1.Label != "p.4 Theorem" {
+		t.Errorf("unexpected pin 1: %+v", pin1)
+	}
+	clean1 := CleanDelimiters(text1)
+	if clean1 != "See theorem in p.4 Theorem" {
+		t.Errorf("unexpected clean text 1: %s", clean1)
+	}
+
+	// Case 2: Markdown style [Quote](pdf:doc#page=12&highlight=hl_abc)
+	text2 := "According to [Key Quote](pdf:doc_456#page=12&highlight=hl_abc)"
+	res2 := ParseContent(text2)
+	if len(res2.PDFPins) != 1 {
+		t.Fatalf("expected 1 PDF pin for markdown style, got %d", len(res2.PDFPins))
+	}
+	pin2 := res2.PDFPins[0]
+	if pin2.DocID != "doc_456" || pin2.PageNumber != 12 || pin2.HighlightID != "hl_abc" || pin2.Label != "Key Quote" {
+		t.Errorf("unexpected pin 2: %+v", pin2)
+	}
+	clean2 := CleanDelimiters(text2)
+	if clean2 != "According to Key Quote" {
+		t.Errorf("unexpected clean text 2: %s", clean2)
+	}
+
+	// Case 3: Delimiter card with PDF pin
+	text3 := "Mitochondria :: Powerhouse 📌 [[pdf:bio_doc#p=2&h=hl_1|p.2]]"
+	res3 := ParseContent(text3)
+	if len(res3.Cards) != 1 {
+		t.Fatalf("expected 1 card, got %d", len(res3.Cards))
+	}
+	if res3.Cards[0].Back != "Powerhouse 📌 p.2" {
+		t.Errorf("expected clean card back 'Powerhouse 📌 p.2', got '%s'", res3.Cards[0].Back)
+	}
+}
+

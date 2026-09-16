@@ -233,6 +233,16 @@ func TestMCPPDFTools(t *testing.T) {
 	if !strings.Contains(string(createHlRespRaw), "Wave-particle duality") {
 		t.Fatalf("expected highlight text in response: %s", string(createHlRespRaw))
 	}
+	if !strings.Contains(string(createHlRespRaw), "pin_ref") || !strings.Contains(string(createHlRespRaw), "[[pdf:") {
+		t.Fatalf("expected pin_ref in create_pdf_highlight response: %s", string(createHlRespRaw))
+	}
+
+	// 2b. Test validation: missing required text/page_number
+	badCreateReq := `{"jsonrpc":"2.0","id":211,"method":"tools/call","params":{"name":"create_pdf_highlight","arguments":{"pdf_id":"test","page_number":0,"text_content":""}}}`
+	badCreateRespRaw, _ := srv.HandleMessageForUser([]byte(badCreateReq), user.ID)
+	if !strings.Contains(string(badCreateRespRaw), `"isError":true`) {
+		t.Fatalf("expected isError for invalid create_pdf_highlight, got: %s", string(badCreateRespRaw))
+	}
 
 	// 3. Test get_pdf_highlights tool
 	getHlsReq := fmt.Sprintf(`{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"get_pdf_highlights","arguments":{"pdf_id":"%s"}}}`, doc.ID)

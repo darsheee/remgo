@@ -33,10 +33,20 @@ type ParsedReference struct {
 	Alias       string `json:"alias,omitempty"`
 }
 
+// ParsedPDFPin represents a PDF citation pin reference ([[pdf:...]] or [Label](pdf:...)).
+type ParsedPDFPin struct {
+	Raw         string `json:"raw"`
+	DocID       string `json:"doc_id"`
+	PageNumber  int    `json:"page_number"`
+	HighlightID string `json:"highlight_id,omitempty"`
+	Label       string `json:"label,omitempty"`
+}
+
 // ParseResult holds all extracted cards, references, and formatted text.
 type ParseResult struct {
 	Cards      []ParsedCard      `json:"cards"`
 	References []ParsedReference `json:"references"`
+	PDFPins    []ParsedPDFPin    `json:"pdf_pins,omitempty"`
 	CleanText  string            `json:"clean_text"`
 }
 
@@ -45,7 +55,35 @@ var (
 	refRegex = regexp.MustCompile(`\[\[(.*?)\]\]`)
 	// Cloze regex: {{content}} where content can be "text", "c1::text", "text::hint", "c1::text::hint"
 	clozeRegex = regexp.MustCompile(`\{\{(.*?)\}\}`)
+	// Markdown PDF pin regex: [Label](pdf:doc_id#...)
+	pdfMarkdownPinRegex = regexp.MustCompile(`\[([^\]]*)\]\(pdf:([^)]+)\)`)
 )
+
+func parsePDFPinParams(rawRef string) (docID string, pageNum int, hlID string) {
+	pageNum = 1
+	parts := strings.SplitN(rawRef, "#", 2)
+	docID = strings.TrimSpace(parts[0])
+	if len(parts) > 1 {
+		hash := parts[1]
+		for _, param := range strings.Split(hash, "&") {
+			kv := strings.SplitN(param, "=", 2)
+			if len(kv) == 2 {
+				key := strings.ToLower(strings.TrimSpace(kv[0]))
+				val := strings.TrimSpace(kv[1])
+				switch key {
+				case "p", "page":
+					var p int
+					if _, err := fmt.Sscanf(val, "%d", &p); err == nil && p > 0 {
+						pageNum = p
+					}
+				case "h", "highlight":
+					hlID = val
+				}
+			}
+		}
+	}
+	return docID, pageNum, hlID
+}
 
 // ParseContent inspects a Rem's text and extracts flashcards and references.
 func ParseContent(content string) ParseResult {
@@ -53,6 +91,7 @@ func ParseContent(content string) ParseResult {
 	result := ParseResult{
 		Cards:      make([]ParsedCard, 0),
 		References: make([]ParsedReference, 0),
+		PDFPins:    make([]ParsedPDFPin, 0),
 		CleanText:  trimmed,
 	}
 
@@ -66,6 +105,28 @@ func ParseContent(content string) ParseResult {
 		if len(m) > 1 {
 			inner := strings.TrimSpace(m[1])
 			if inner != "" {
+				// If reference is a PDF pin [[pdf:...]], do not treat as a note reference
+				if strings.HasPrefix(strings.ToLower(inner), "pdf:") {
+					rawRef := inner[4:]
+					var label string
+					if parts := strings.SplitN(rawRef, "|", 2); len(parts) == 2 {
+						rawRef = parts[0]
+						label = strings.TrimSpace(parts[1])
+					}
+					docID, pageNum, hlID := parsePDFPinParams(rawRef)
+					if label == "" {
+						label = fmt.Sprintf("p.%d", pageNum)
+					}
+					result.PDFPins = append(result.PDFPins, ParsedPDFPin{
+						Raw:         m[0],
+						DocID:       docID,
+						PageNumber:  pageNum,
+						HighlightID: hlID,
+						Label:       label,
+					})
+					continue
+				}
+
 				var target, alias string
 				if parts := strings.SplitN(inner, "|", 2); len(parts) == 2 {
 					target = strings.TrimSpace(parts[0])
@@ -79,6 +140,26 @@ func ParseContent(content string) ParseResult {
 					Alias:       alias,
 				})
 			}
+		}
+	}
+
+	// 1b. Extract Markdown-style PDF Pins: [Label](pdf:...)
+	mdMatches := pdfMarkdownPinRegex.FindAllStringSubmatch(trimmed, -1)
+	for _, m := range mdMatches {
+		if len(m) > 2 {
+			label := strings.TrimSpace(m[1])
+			rawRef := strings.TrimSpace(m[2])
+			docID, pageNum, hlID := parsePDFPinParams(rawRef)
+			if label == "" {
+				label = fmt.Sprintf("p.%d", pageNum)
+			}
+			result.PDFPins = append(result.PDFPins, ParsedPDFPin{
+				Raw:         m[0],
+				DocID:       docID,
+				PageNumber:  pageNum,
+				HighlightID: hlID,
+				Label:       label,
+			})
 		}
 	}
 
@@ -259,13 +340,35 @@ func parseClozes(content string) []ParsedCard {
 // CleanDelimiters removes delimiter syntax to create clean plain text.
 func CleanDelimiters(text string) string {
 	s := text
-	// Replace [[title|alias]] with alias or title
+	// Replace [[title|alias]] or [[pdf:doc#...|label]] with label or alias
 	s = refRegex.ReplaceAllStringFunc(s, func(m string) string {
 		inner := strings.TrimSuffix(strings.TrimPrefix(m, "[["), "]]")
+		if strings.HasPrefix(strings.ToLower(inner), "pdf:") {
+			rawRef := inner[4:]
+			if parts := strings.SplitN(rawRef, "|", 2); len(parts) == 2 {
+				return strings.TrimSpace(parts[1])
+			}
+			_, pageNum, _ := parsePDFPinParams(rawRef)
+			return fmt.Sprintf("p.%d", pageNum)
+		}
 		if parts := strings.SplitN(inner, "|", 2); len(parts) == 2 {
 			return parts[1]
 		}
 		return inner
+	})
+
+	// Replace [label](pdf:doc#...) with label
+	s = pdfMarkdownPinRegex.ReplaceAllStringFunc(s, func(m string) string {
+		sub := pdfMarkdownPinRegex.FindStringSubmatch(m)
+		if len(sub) > 2 {
+			label := strings.TrimSpace(sub[1])
+			if label != "" {
+				return label
+			}
+			_, pageNum, _ := parsePDFPinParams(sub[2])
+			return fmt.Sprintf("p.%d", pageNum)
+		}
+		return m
 	})
 
 	// Replace {{c1::text::hint}} or {{text}} with text

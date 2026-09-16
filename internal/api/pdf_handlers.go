@@ -21,6 +21,9 @@ func (s *Server) handleUploadPDF(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "failed to parse multipart form: "+err.Error())
 			return
 		}
+		if r.MultipartForm != nil {
+			defer func() { _ = r.MultipartForm.RemoveAll() }()
+		}
 		file, header, err := r.FormFile("file")
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "missing 'file' field in multipart form")
@@ -75,6 +78,37 @@ func (s *Server) handleGetPDF(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, doc)
 }
 
+// handleUpdatePDF updates mutable PDF document metadata like page count.
+func (s *Server) handleUpdatePDF(w http.ResponseWriter, r *http.Request) {
+	userID := s.getUserID(r)
+	id := r.PathValue("id")
+
+	var body struct {
+		PageCount    *int    `json:"page_count"`
+		OriginalName *string `json:"original_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	doc, err := s.db.GetPDF(userID, id)
+	if err != nil || doc == nil {
+		writeError(w, http.StatusNotFound, "pdf document not found")
+		return
+	}
+
+	if body.PageCount != nil && *body.PageCount > 0 {
+		if err := s.db.UpdatePDFPageCount(userID, id, *body.PageCount); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		doc.PageCount = *body.PageCount
+	}
+
+	writeJSON(w, http.StatusOK, doc)
+}
+
 // handleStreamPDFContent streams the raw PDF binary content with byte-range support.
 func (s *Server) handleStreamPDFContent(w http.ResponseWriter, r *http.Request) {
 	userID := s.getUserID(r)
@@ -108,6 +142,10 @@ func (s *Server) handleListPDFHighlights(w http.ResponseWriter, r *http.Request)
 	id := r.PathValue("id")
 	highlights, err := s.db.ListPDFHighlights(userID, id)
 	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -130,6 +168,11 @@ func (s *Server) handleCreatePDFHighlight(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if strings.TrimSpace(body.TextContent) == "" {
+		writeError(w, http.StatusBadRequest, "text_content cannot be empty")
+		return
+	}
+
 	rectsStr := "[]"
 	if len(body.RectsJSON) > 0 {
 		var s string
@@ -140,8 +183,17 @@ func (s *Server) handleCreatePDFHighlight(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	if !json.Valid([]byte(rectsStr)) {
+		writeError(w, http.StatusBadRequest, "invalid rects_json: must be valid JSON array")
+		return
+	}
+
 	hl, err := s.db.CreatePDFHighlight(userID, id, body.PageNumber, rectsStr, body.TextContent, body.Color)
 	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -151,11 +203,22 @@ func (s *Server) handleCreatePDFHighlight(w http.ResponseWriter, r *http.Request
 // handleDeletePDFHighlight deletes a highlight annotation.
 func (s *Server) handleDeletePDFHighlight(w http.ResponseWriter, r *http.Request) {
 	userID := s.getUserID(r)
-	id := r.PathValue("id")
-	if id == "" {
-		id = r.PathValue("hl_id")
+	hlID := r.PathValue("hl_id")
+	pdfID := ""
+	if hlID != "" {
+		// Route: DELETE /api/pdfs/{id}/highlights/{hl_id}
+		pdfID = r.PathValue("id")
+	} else {
+		// Route: DELETE /api/highlights/{id}
+		hlID = r.PathValue("id")
 	}
-	err := s.db.DeletePDFHighlight(userID, id)
+
+	if hlID == "" {
+		writeError(w, http.StatusBadRequest, "missing highlight id")
+		return
+	}
+
+	err := s.db.DeletePDFHighlightForPDF(userID, pdfID, hlID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return

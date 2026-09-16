@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -237,7 +239,7 @@ func (d *DB) ListUsers() ([]*User, error) {
 	return users, nil
 }
 
-// DeleteUser removes a user and cascades all their notes, cards, and keys.
+// DeleteUser removes a user and cascades all their notes, cards, and keys, and cleans up uploaded PDF files.
 func (d *DB) DeleteUser(id string) error {
 	if id == DefaultUserID {
 		return errors.New("cannot delete default user")
@@ -245,8 +247,32 @@ func (d *DB) DeleteUser(id string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	_, err := d.sqlDB.Exec("DELETE FROM users WHERE id = ?", id)
-	return err
+	// 1. Find user's PDF files to delete from disk
+	rows, err := d.sqlDB.Query("SELECT filename FROM pdfs WHERE user_id = ?", id)
+	var filenames []string
+	if err == nil {
+		for rows.Next() {
+			var fn string
+			if err := rows.Scan(&fn); err == nil && fn != "" {
+				filenames = append(filenames, fn)
+			}
+		}
+		rows.Close()
+	}
+
+	// 2. Delete user record (cascades database tables)
+	_, err = d.sqlDB.Exec("DELETE FROM users WHERE id = ?", id)
+	if err != nil {
+		return err
+	}
+
+	// 3. Delete physical PDF files from storage
+	for _, fn := range filenames {
+		filePath := filepath.Join(d.pdfDir, fn)
+		_ = os.Remove(filePath)
+	}
+
+	return nil
 }
 
 // CreateSession creates a cryptographic session token stored as a SHA-256 hash.

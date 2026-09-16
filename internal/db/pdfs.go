@@ -37,11 +37,19 @@ type PDFHighlight struct {
 	TextContent string    `json:"text_content"`
 	Color       string    `json:"color"`
 	CreatedAt   time.Time `json:"created_at"`
+	PinRef      string    `json:"pin_ref,omitempty"`
+}
+
+// computePinRef formats a canonical pin reference string for a highlight.
+func computePinRef(pdfID string, pageNumber int, highlightID string) string {
+	return fmt.Sprintf("[[pdf:%s#p=%d&h=%s|p.%d]]", pdfID, pageNumber, highlightID, pageNumber)
 }
 
 var (
-	// Regex matching /Type /Pages dictionaries with /Count N
-	pdfPagesCountRegex = regexp.MustCompile(`(?s)/Type\s*/Pages.*?/Count\s+(\d+)`)
+	// Regex matching /Type /Pages dictionaries with /Count N (order 1: Type then Count)
+	pdfPagesCountRegex1 = regexp.MustCompile(`(?s)/Type\s*/Pages[^>]*?/Count\s+(\d+)`)
+	// Regex matching /Type /Pages dictionaries with /Count N (order 2: Count then Type)
+	pdfPagesCountRegex2 = regexp.MustCompile(`(?s)/Count\s+(\d+)[^>]*?/Type\s*/Pages`)
 	// Fallback regex matching general /Count N in PDF objects
 	pdfCountRegex = regexp.MustCompile(`/Count\s+(\d+)`)
 	// Fallback regex matching individual /Type /Page objects (excluding /Pages)
@@ -52,9 +60,17 @@ var (
 func CountPDFPages(data []byte) int {
 	maxCount := 0
 
-	// 1. Primary: search for /Type /Pages ... /Count N
-	matches := pdfPagesCountRegex.FindAllSubmatch(data, -1)
-	for _, m := range matches {
+	// 1. Primary: search for /Type /Pages ... /Count N in either dictionary order
+	matches1 := pdfPagesCountRegex1.FindAllSubmatch(data, -1)
+	for _, m := range matches1 {
+		if len(m) > 1 {
+			if cnt, err := strconv.Atoi(string(m[1])); err == nil && cnt > maxCount {
+				maxCount = cnt
+			}
+		}
+	}
+	matches2 := pdfPagesCountRegex2.FindAllSubmatch(data, -1)
+	for _, m := range matches2 {
 		if len(m) > 1 {
 			if cnt, err := strconv.Atoi(string(m[1])); err == nil && cnt > maxCount {
 				maxCount = cnt
@@ -340,6 +356,7 @@ func (d *DB) CreatePDFHighlight(userID string, pdfID string, pageNumber int, rec
 		TextContent: textContent,
 		Color:       color,
 		CreatedAt:   now,
+		PinRef:      computePinRef(pdfID, pageNumber, id),
 	}, nil
 }
 
@@ -366,6 +383,7 @@ func (d *DB) GetPDFHighlight(userID string, highlightID string) (*PDFHighlight, 
 		}
 		return nil, fmt.Errorf("failed to query highlight: %w", err)
 	}
+	hl.PinRef = computePinRef(hl.PDFID, hl.PageNumber, hl.ID)
 	return &hl, nil
 }
 
@@ -406,6 +424,7 @@ func (d *DB) ListPDFHighlights(userID string, pdfID string) ([]*PDFHighlight, er
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan highlight row: %w", err)
 		}
+		hl.PinRef = computePinRef(hl.PDFID, hl.PageNumber, hl.ID)
 		list = append(list, &hl)
 	}
 	if list == nil {
@@ -414,15 +433,30 @@ func (d *DB) ListPDFHighlights(userID string, pdfID string) ([]*PDFHighlight, er
 	return list, nil
 }
 
-// DeletePDFHighlight removes a highlight annotation.
+// DeletePDFHighlight removes a highlight annotation by highlight ID.
 func (d *DB) DeletePDFHighlight(userID string, highlightID string) error {
+	return d.DeletePDFHighlightForPDF(userID, "", highlightID)
+}
+
+// DeletePDFHighlightForPDF removes a highlight annotation, verifying PDF ownership if pdfID is provided.
+func (d *DB) DeletePDFHighlightForPDF(userID string, pdfID string, highlightID string) error {
 	if userID == "" {
 		userID = DefaultUserID
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	res, err := d.sqlDB.Exec("DELETE FROM pdf_highlights WHERE id = ? AND user_id = ?", highlightID, userID)
+	var query string
+	var args []interface{}
+	if pdfID != "" {
+		query = "DELETE FROM pdf_highlights WHERE id = ? AND pdf_id = ? AND user_id = ?"
+		args = []interface{}{highlightID, pdfID, userID}
+	} else {
+		query = "DELETE FROM pdf_highlights WHERE id = ? AND user_id = ?"
+		args = []interface{}{highlightID, userID}
+	}
+
+	res, err := d.sqlDB.Exec(query, args...)
 	if err != nil {
 		return fmt.Errorf("failed to delete highlight: %w", err)
 	}

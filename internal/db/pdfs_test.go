@@ -53,6 +53,18 @@ func TestCountPDFPages(t *testing.T) {
 	if count := CountPDFPages(rawSingle); count != 1 {
 		t.Fatalf("expected 1 page default, got %d", count)
 	}
+
+	// Case 5: PDF dictionary where /Count precedes /Type /Pages
+	countFirst := []byte("%PDF-1.4\n1 0 obj\n<< /Count 8 /Kids [2 0 R] /Type /Pages >>\nendobj\n%%EOF")
+	if count := CountPDFPages(countFirst); count != 8 {
+		t.Fatalf("expected 8 pages from /Count preceding /Type /Pages, got %d", count)
+	}
+
+	// Case 6: PDF with Outlines /Count 50 should NOT override Pages /Count 3
+	outlineDoc := []byte("%PDF-1.4\n1 0 obj\n<< /Type /Outlines /Count 50 >>\nendobj\n2 0 obj\n<< /Type /Pages /Count 3 >>\nendobj\n%%EOF")
+	if count := CountPDFPages(outlineDoc); count != 3 {
+		t.Fatalf("expected 3 pages (ignoring /Outlines /Count 50), got %d", count)
+	}
 }
 
 func TestPDFStorageAndHighlights(t *testing.T) {
@@ -146,6 +158,10 @@ func TestPDFStorageAndHighlights(t *testing.T) {
 	if hl1.PDFID != docA.ID || hl1.PageNumber != 1 {
 		t.Errorf("highlight metadata mismatch: %+v", hl1)
 	}
+	expectedPinRef := fmt.Sprintf("[[pdf:%s#p=1&h=%s|p.1]]", docA.ID, hl1.ID)
+	if hl1.PinRef != expectedPinRef {
+		t.Errorf("expected PinRef '%s', got '%s'", expectedPinRef, hl1.PinRef)
+	}
 
 	hl2, err := database.CreatePDFHighlight(userA, docA.ID, 3, rects, "Glycolysis occurs in the cytoplasm", "#a7f3d0")
 	if err != nil {
@@ -170,9 +186,21 @@ func TestPDFStorageAndHighlights(t *testing.T) {
 		t.Errorf("highlights not ordered by page number: %v, %v", hlsA[0].PageNumber, hlsA[1].PageNumber)
 	}
 
-	// 6. Delete single highlight
-	if err := database.DeletePDFHighlight(userA, hl1.ID); err != nil {
-		t.Fatalf("failed to delete highlight: %v", err)
+	// 5b. Test UpdatePDFPageCount
+	if err := database.UpdatePDFPageCount(userA, docA.ID, 10); err != nil {
+		t.Fatalf("failed to update page count: %v", err)
+	}
+	updatedDoc, err := database.GetPDF(userA, docA.ID)
+	if err != nil || updatedDoc.PageCount != 10 {
+		t.Fatalf("expected updated page count 10, got %v (err: %v)", updatedDoc, err)
+	}
+
+	// 6. Delete single highlight verifying PDF ownership (wrong PDFID must fail)
+	if err := database.DeletePDFHighlightForPDF(userA, "wrong_pdf_id", hl1.ID); err == nil {
+		t.Fatal("expected error deleting highlight with mismatched pdf_id")
+	}
+	if err := database.DeletePDFHighlightForPDF(userA, docA.ID, hl1.ID); err != nil {
+		t.Fatalf("failed to delete highlight with matching pdf_id: %v", err)
 	}
 	hlsAfterDel, err := database.ListPDFHighlights(userA, docA.ID)
 	if err != nil || len(hlsAfterDel) != 1 {
@@ -194,5 +222,48 @@ func TestPDFStorageAndHighlights(t *testing.T) {
 	}
 	if hlCheck != nil {
 		t.Errorf("highlight was not deleted with PDF: %+v", hlCheck)
+	}
+}
+
+func TestDeleteUserCleansPDFStorage(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "remgo_user_pdf_clean_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.db")
+	database, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	charlie, err := database.CreateUser("charlie", "charlie@example.com", "pass123", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pdfBytes := makeTestPDF(3)
+	doc, err := database.SavePDF(charlie.ID, "Charlie_Notes.pdf", bytes.NewReader(pdfBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	filePath, _, err := database.GetPDFFilePath(charlie.ID, doc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("file should exist on disk: %v", err)
+	}
+
+	// Delete user charlie -> should delete DB rows AND disk file
+	if err := database.DeleteUser(charlie.ID); err != nil {
+		t.Fatalf("failed to delete user: %v", err)
+	}
+
+	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
+		t.Errorf("expected PDF file to be removed from disk when user was deleted, but it still exists: %s", filePath)
 	}
 }

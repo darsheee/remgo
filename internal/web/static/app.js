@@ -582,6 +582,10 @@ class RemGoApp {
     }
   }
 
+  loadDocument(id) {
+    return this.zoomTo(id);
+  }
+
   renderBreadcrumbs() {
     const bar = document.getElementById('breadcrumbsBar');
     bar.innerHTML = '';
@@ -675,9 +679,9 @@ class RemGoApp {
     const badge = this.createCardBadge(node.content);
     if (badge) inputWrapper.appendChild(badge);
 
-    // PDF Pin Badge
-    const pinBadge = this.createPdfPinBadge(node.content);
-    if (pinBadge) inputWrapper.appendChild(pinBadge);
+    // PDF Pin Badges
+    const pinBadges = this.createPdfPinBadges(node.content);
+    pinBadges.forEach(b => inputWrapper.appendChild(b));
 
     row.appendChild(toggle);
     row.appendChild(dotWrapper);
@@ -746,8 +750,8 @@ class RemGoApp {
         existingBadges.forEach(b => b.remove());
         const newBadge = this.createCardBadge(text);
         if (newBadge) editor.parentElement.appendChild(newBadge);
-        const pinBadge = this.createPdfPinBadge(text);
-        if (pinBadge) editor.parentElement.appendChild(pinBadge);
+        const pinBadges = this.createPdfPinBadges(text);
+        pinBadges.forEach(b => editor.parentElement.appendChild(b));
 
         if (remID && remID !== 'new') {
           await this.fetchAPI(`/api/rems/${remID}`, {
@@ -982,6 +986,19 @@ class RemGoApp {
     crumbsEl.innerHTML = (card.breadcrumbs || []).map(b => this.escapeHTML(b)).join(' > ');
     promptEl.innerText = card.front;
     answerEl.innerText = card.back;
+
+    // Attach interactive PDF Pin badges if flashcard references PDF highlights
+    const pinBadges = this.createPdfPinBadges(card.back + ' ' + (card.front || ''));
+    if (pinBadges && pinBadges.length > 0) {
+      const pinContainer = document.createElement('div');
+      pinContainer.style.marginTop = '12px';
+      pinContainer.style.display = 'flex';
+      pinContainer.style.flexWrap = 'wrap';
+      pinContainer.style.gap = '6px';
+      pinBadges.forEach(b => pinContainer.appendChild(b));
+      answerEl.appendChild(pinContainer);
+    }
+
     answerWrapper.style.display = 'none';
 
     if (card.next_previews) {
@@ -1680,6 +1697,16 @@ class RemGoApp {
     if (totalEl) totalEl.innerText = numPages;
     if (pageInput) pageInput.max = numPages;
 
+    // Sync real decoded page count with backend if discrepancy exists
+    if (numPages && this.currentPdfDoc.page_count !== numPages) {
+      this.currentPdfDoc.page_count = numPages;
+      this.fetchAPI(`/api/pdfs/${docId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page_count: numPages })
+      }).catch(e => console.error('Failed to sync PDF page count', e));
+    }
+
     for (let pageNum = 1; pageNum <= numPages; pageNum++) {
       const pageWrapper = document.createElement('div');
       pageWrapper.className = 'pdf-page-wrapper';
@@ -1757,6 +1784,7 @@ class RemGoApp {
         textLayer.innerHTML = '';
         textLayer.style.width = `${viewport.width}px`;
         textLayer.style.height = `${viewport.height}px`;
+        textLayer.style.setProperty('--scale-factor', viewport.scale);
 
         const textContent = await page.getTextContent();
         if (window.pdfjsLib && window.pdfjsLib.renderTextLayer) {
@@ -1854,7 +1882,7 @@ class RemGoApp {
     }
   }
 
-  async jumpToPdfPage(pageNum) {
+  async jumpToPdfPage(pageNum, skipScroll = false) {
     if (!this.currentPdf || pageNum < 1 || pageNum > this.currentPdf.numPages) return;
     this.currentPdfPage = pageNum;
     const pageInput = document.getElementById('pdfPageInput');
@@ -1862,9 +1890,11 @@ class RemGoApp {
 
     await this.renderPdfPage(pageNum);
 
-    const pageEl = document.getElementById(`pdf-page-${pageNum}`);
-    if (pageEl) {
-      pageEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (!skipScroll) {
+      const pageEl = document.getElementById(`pdf-page-${pageNum}`);
+      if (pageEl) {
+        pageEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
     }
   }
 
@@ -2040,49 +2070,79 @@ class RemGoApp {
   // PDF Pin Backlinks & Jumping
   // ========================================================
 
+  parsePdfPins(content) {
+    if (!content) return [];
+    const pins = [];
+
+    // Format 1: [[pdf:doc_id#...|Label]] or [[pdf:doc_id#...]]
+    const regex1 = /\[\[pdf:([^|\]]+)(?:\|([^\]]+))?\]\]/g;
+    let m1;
+    while ((m1 = regex1.exec(content)) !== null) {
+      const rawRef = m1[1];
+      const label = m1[2];
+      const [docId, hash] = rawRef.split('#');
+      const params = new URLSearchParams(hash || '');
+      const pageNum = parseInt(params.get('p') || params.get('page') || '1', 10);
+      const highlightId = params.get('h') || params.get('highlight') || '';
+      pins.push({
+        docId: (docId || '').trim(),
+        pageNum: pageNum > 0 ? pageNum : 1,
+        highlightId: (highlightId || '').trim(),
+        label: (label || `p.${pageNum}`).trim()
+      });
+    }
+
+    // Format 2: [Label](pdf:doc_id#...)
+    const regex2 = /\[([^\]]*)\]\(pdf:([^)]+)\)/g;
+    let m2;
+    while ((m2 = regex2.exec(content)) !== null) {
+      const label = m2[1];
+      const rawRef = m2[2];
+      const [docId, hash] = rawRef.split('#');
+      const params = new URLSearchParams(hash || '');
+      const pageNum = parseInt(params.get('p') || params.get('page') || '1', 10);
+      const highlightId = params.get('h') || params.get('highlight') || '';
+      pins.push({
+        docId: (docId || '').trim(),
+        pageNum: pageNum > 0 ? pageNum : 1,
+        highlightId: (highlightId || '').trim(),
+        label: (label || `p.${pageNum}`).trim()
+      });
+    }
+
+    return pins;
+  }
+
   parsePdfPin(content) {
-    if (!content) return null;
-    // Format 1: [[pdf:doc_id#p=1&h=hl_xxx|Label]] or [[pdf:doc_id#p=1&h=hl_xxx]]
-    const m1 = content.match(/\[\[pdf:([^#|\]]+)#p=(\d+)(?:&h=([^|\]]+))?(?:\|([^\]]+))?\]\]/);
-    if (m1) {
-      return {
-        docId: m1[1],
-        pageNum: parseInt(m1[2], 10),
-        highlightId: m1[3] || '',
-        label: m1[4] || `p.${m1[2]}`
-      };
-    }
+    const pins = this.parsePdfPins(content);
+    return pins.length > 0 ? pins[0] : null;
+  }
 
-    // Format 2: [Label](pdf:doc_id#p=1&h=hl_xxx)
-    const m2 = content.match(/\[([^\]]*)\]\(pdf:([^#)]+)#p=(\d+)(?:&h=([^)]+))?\)/);
-    if (m2) {
-      return {
-        label: m2[1] || `p.${m2[3]}`,
-        docId: m2[2],
-        pageNum: parseInt(m2[3], 10),
-        highlightId: m2[4] || ''
-      };
-    }
+  createPdfPinBadges(content) {
+    const pins = this.parsePdfPins(content);
+    if (!pins || pins.length === 0) return [];
 
-    return null;
+    return pins.map(pin => {
+      const span = document.createElement('span');
+      span.className = 'bullet-badge pdf-pin-badge';
+      span.innerHTML = `📌 <span>${this.escapeHTML(pin.label || ('p.' + pin.pageNum))}</span>`;
+      span.title = `Jump to PDF page ${pin.pageNum}`;
+      span.onclick = (e) => {
+        e.stopPropagation();
+        this.jumpToPdfPin(pin.docId, pin.pageNum, pin.highlightId);
+      };
+      return span;
+    });
   }
 
   createPdfPinBadge(content) {
-    const pin = this.parsePdfPin(content);
-    if (!pin) return null;
-
-    const span = document.createElement('span');
-    span.className = 'bullet-badge pdf-pin-badge';
-    span.innerHTML = `📌 <span>${this.escapeHTML(pin.label || ('p.' + pin.pageNum))}</span>`;
-    span.title = `Jump to PDF page ${pin.pageNum}`;
-    span.onclick = (e) => {
-      e.stopPropagation();
-      this.jumpToPdfPin(pin.docId, pin.pageNum, pin.highlightId);
-    };
-    return span;
+    const badges = this.createPdfPinBadges(content);
+    return badges.length > 0 ? badges[0] : null;
   }
 
   async jumpToPdfPin(docId, pageNum, highlightId) {
+    this.switchView('outliner');
+
     // 1. Ensure Split View is active
     const wrapper = document.getElementById('outlinerSplitWrapper');
     const pane = document.getElementById('pdfReaderPane');
@@ -2102,23 +2162,26 @@ class RemGoApp {
       await this.loadPdfDocument(docId);
     }
 
-    // 3. Scroll to page
-    await this.jumpToPdfPage(pageNum);
+    // 3. Scroll to page (skip top scroll if highlight will center)
+    await this.jumpToPdfPage(pageNum, Boolean(highlightId));
 
     // 4. Flash highlight
     if (highlightId) {
-      this.flashHighlight(highlightId);
+      this.flashHighlight(highlightId, pageNum);
     }
   }
 
-  flashHighlight(highlightId) {
+  flashHighlight(highlightId, pageNum) {
     const tryFlash = () => {
-      const el = document.getElementById(`hl-${highlightId}`) ||
-                 document.querySelector(`[data-highlight-id="${highlightId}"]`);
-      if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        el.classList.add('highlight-flash');
-        setTimeout(() => el.classList.remove('highlight-flash'), 2500);
+      const boxes = document.querySelectorAll(`[data-highlight-id="${highlightId}"]`);
+      if (boxes && boxes.length > 0) {
+        boxes[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        boxes.forEach(b => {
+          b.classList.remove('highlight-flash');
+          void b.offsetWidth;
+          b.classList.add('highlight-flash');
+          setTimeout(() => b.classList.remove('highlight-flash'), 2500);
+        });
         return true;
       }
       return false;
@@ -2127,9 +2190,14 @@ class RemGoApp {
     if (!tryFlash()) {
       setTimeout(() => {
         if (!tryFlash()) {
-          setTimeout(tryFlash, 500);
+          setTimeout(() => {
+            if (!tryFlash() && pageNum) {
+              const pageEl = document.getElementById(`pdf-page-${pageNum}`);
+              if (pageEl) pageEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+          }, 400);
         }
-      }, 250);
+      }, 200);
     }
   }
 
@@ -2292,6 +2360,9 @@ class RemGoApp {
 
       // 3. Determine target document
       let targetDocID = this.currentDocID;
+      let parentID = this.lastFocusedParentID || targetDocID;
+      let afterID = this.lastFocusedRemID || null;
+
       if (!targetDocID) {
         const title = `Notes on ${this.currentPdfDoc.original_name}`;
         const newDocRes = await this.fetchAPI('/api/rems', {
@@ -2302,6 +2373,8 @@ class RemGoApp {
         if (newDocRes && newDocRes.ok) {
           const newDoc = await newDocRes.json();
           targetDocID = newDoc.id;
+          parentID = newDoc.id;
+          afterID = null;
           await this.loadDocuments();
         }
       }
@@ -2309,10 +2382,10 @@ class RemGoApp {
       // Insert rem bullet
       const payload = {
         content: remContent,
-        parent_id: this.lastFocusedParentID || targetDocID,
+        parent_id: parentID,
       };
-      if (this.lastFocusedRemID) {
-        payload.after_id = this.lastFocusedRemID;
+      if (afterID) {
+        payload.after_id = afterID;
       }
 
       const insertRes = await this.fetchAPI('/api/rems', {
@@ -2326,7 +2399,7 @@ class RemGoApp {
         if (this.isPdfFullscreen) {
           this.togglePdfFullscreen();
         }
-        await this.loadDocument(targetDocID);
+        await this.zoomTo(targetDocID);
 
         setTimeout(() => {
           const el = document.querySelector(`[data-id="${createdRem.id}"]`);
@@ -2364,10 +2437,19 @@ class RemGoApp {
       const hl = await hlRes.json();
       this.pdfHighlights.push(hl);
 
+      const pageWrapper = document.getElementById(`pdf-page-${pageNum}`);
+      if (pageWrapper) {
+        this.renderHighlightsForPage(pageNum, pageWrapper.querySelector('.pdf-highlight-layer'));
+      }
+      this.updateHighlightsDrawer();
+
       const pinRef = `[[pdf:${docId}#p=${pageNum}&h=${hl.id}|p.${pageNum}]]`;
       const remContent = `${text} :: 📌 ${pinRef}`;
 
       let targetDocID = this.currentDocID;
+      let parentID = this.lastFocusedParentID || targetDocID;
+      let afterID = this.lastFocusedRemID || null;
+
       if (!targetDocID) {
         const title = `Notes on ${this.currentPdfDoc.original_name}`;
         const newDocRes = await this.fetchAPI('/api/rems', {
@@ -2378,15 +2460,17 @@ class RemGoApp {
         if (newDocRes && newDocRes.ok) {
           const newDoc = await newDocRes.json();
           targetDocID = newDoc.id;
+          parentID = newDoc.id;
+          afterID = null;
           await this.loadDocuments();
         }
       }
 
       const payload = {
         content: remContent,
-        parent_id: this.lastFocusedParentID || targetDocID,
+        parent_id: parentID,
       };
-      if (this.lastFocusedRemID) payload.after_id = this.lastFocusedRemID;
+      if (afterID) payload.after_id = afterID;
 
       const res = await this.fetchAPI('/api/rems', {
         method: 'POST',
@@ -2397,7 +2481,7 @@ class RemGoApp {
       if (res && res.ok) {
         const createdRem = await res.json();
         if (this.isPdfFullscreen) this.togglePdfFullscreen();
-        await this.loadDocument(targetDocID);
+        await this.zoomTo(targetDocID);
         this.clearPdfSelection();
         this.showToast('Flashcard created from excerpt!');
         this.focusEditorByID(createdRem.id);
@@ -2425,6 +2509,12 @@ class RemGoApp {
       if (!hlRes || !hlRes.ok) return;
       const hl = await hlRes.json();
       this.pdfHighlights.push(hl);
+
+      const pageWrapper = document.getElementById(`pdf-page-${pageNum}`);
+      if (pageWrapper) {
+        this.renderHighlightsForPage(pageNum, pageWrapper.querySelector('.pdf-highlight-layer'));
+      }
+      this.updateHighlightsDrawer();
 
       const pinRef = `[[pdf:${docId}#p=${pageNum}&h=${hl.id}|p.${pageNum}]]`;
       const remContent = `"${text}" 📌 ${pinRef}`;

@@ -146,6 +146,8 @@ func (s *Server) registerRoutes(staticHandler http.Handler) {
 	s.mux.HandleFunc("POST /api/pdfs", s.handleUploadPDF)
 	s.mux.HandleFunc("GET /api/pdfs", s.handleListPDFs)
 	s.mux.HandleFunc("GET /api/pdfs/{id}", s.handleGetPDF)
+	s.mux.HandleFunc("PATCH /api/pdfs/{id}", s.handleUpdatePDF)
+	s.mux.HandleFunc("PUT /api/pdfs/{id}", s.handleUpdatePDF)
 	s.mux.HandleFunc("GET /api/pdfs/{id}/content", s.handleStreamPDFContent)
 	s.mux.HandleFunc("DELETE /api/pdfs/{id}", s.handleDeletePDF)
 	s.mux.HandleFunc("GET /api/pdfs/{id}/highlights", s.handleListPDFHighlights)
